@@ -4,45 +4,63 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.ServicePointManager]::SecurityProtocol
 
+# 提升并发连接数、关闭 Expect100Continue，减少连接被服务端意外关闭的概率
+
+[Net.ServicePointManager]::DefaultConnectionLimit = 100
+
+[Net.ServicePointManager]::Expect100Continue = $false
+
 $ErrorActionPreference = "Stop"
 
-# �� 字�名常�?(东财 push2 / 新浪通用) ��
+# 关掉 Invoke-WebRequest / Invoke-RestMethod 的进度条。
+# 该进度条由 PowerShell 宿主直接画在控制台上（反色蓝条），不经过本脚本的写屏函数；
+# 每次取数都会画一次再擦一次，于是出现“蓝底一闪”，还可能把表格顶动。
+# 实测（.frame_log.txt）：两次闪烁时刻脚本一次屏幕都没写，时间点正好落在分块取数上。
+$ProgressPreference = 'SilentlyContinue'
 
-$F_PRICE      = 'f2'   # �新价
+# 字段名常量（东财 push2 / 新浪通用）
 
-$F_PCT_CHG    = 'f3'   # 涨跌�?%)
+$F_PRICE      = 'f2'   # 最新价
 
-$F_CHG        = 'f4'   # 涨跌�?
+$F_PCT_CHG    = 'f3'   # 涨跌幅(%)
 
-$F_VOL        = 'f5'   # 成交�?�?
+$F_CHG        = 'f4'   # 涨跌额
 
-$F_AMT        = 'f6'   # 成交�?�?
+$F_VOL        = 'f5'   # 成交量(手)
 
-$F_TURNOVER   = 'f8'   # 换手�?%)
+$F_AMT        = 'f6'   # 成交额(元)
+
+$F_TURNOVER   = 'f8'   # 换手率(%)
 
 $F_VOL_RATIO  = 'f10'  # 量比
 
 $F_CODE       = 'f12'  # 代码
 
-$F_MARKET     = 'f13'  # 市场 (0=�? 1=�?
+$F_MARKET     = 'f13'  # 市场 (0=深, 1=沪)
 
 $F_NAME       = 'f14'  # 名称
 
-$F_HIGH       = 'f15'  # �高价
+$F_HIGH       = 'f15'  # 最高价
 
-$F_LOW        = 'f16'  # �低价
+$F_LOW        = 'f16'  # 最低价
 
 $F_OPEN       = 'f17'  # 今开
 
 $F_PREV_CLOSE = 'f18'  # 昨收
 
-# ---------- 字�集合（按模式精简请求�?----------
+# ---------- 字段集合（按模式精简请求字段）----------
 
 $FULL_FIELDS    = 'f12,f13,f14,f2,f3,f4,f5,f6,f8,f10,f15,f16,f17,f18,f20,f21,f30'
 
 $STEALTH_FIELDS = 'f2,f3,f4,f6,f8,f10,f12,f13,f14,f20,f21,f30'  # f6 留给指数计算三市成交额
 
-# ---------- 基�工具 ----------
+# ---------- 表格宽度常量 ----------
+
+$STEALTH_TABLE_WIDTH = 64
+
+$NORMAL_TABLE_WIDTH = 114
+
+# ---------- 基础工具 ----------
 
 function Fetch-Json($url, $timeout = 15, $retries = 1) {
 
@@ -60,7 +78,7 @@ function Fetch-Json($url, $timeout = 15, $retries = 1) {
 
         try {
 
-            return Invoke-RestMethod -Uri $url -TimeoutSec $timeout -UseBasicParsing -Headers $headers
+            return Invoke-RestMethod -Uri $url -TimeoutSec $timeout -UseBasicParsing -Headers $headers -DisableKeepAlive
 
         } catch {
 
@@ -92,21 +110,17 @@ function Convert-SecidToSinaCode($secid) {
 
     }
 
-    $prefix = switch ($market) {
-
-        '0' { 'sz' }
-
-        '1' { 'sh' }
-
-        default { 'bj' }
-
+    $prefix = ''
+    if ($market -eq '1') {
+        if ($code -match '^000(001|688)$') { $prefix = 's_sh' } else { $prefix = 'sh' }
+    } elseif ($market -eq '0') {
+        if ($code -match '^899\d{3}$') { $prefix = 's_bj' }
+        elseif ($code -match '^(399|930)\d{3}$') { $prefix = 's_sz' }
+        elseif ($code -match '^(4|8|92)\d{4,5}$') { $prefix = 'bj' }
+        else { $prefix = 'sz' }
+    } else {
+        $prefix = 'bj'
     }
-
-    $isShIndex = ($market -eq '1') -and ($code -match '^000(001|688)$')
-
-    $isSzOrBjIndex = ($market -eq '0') -and ($code -match '^(399|899|930)\d{3}$')
-
-    if ($isShIndex -or $isSzOrBjIndex) { $prefix = 's_' + $prefix }
 
     return "$prefix$code"
 
@@ -136,7 +150,7 @@ function Parse-SinaQuoteResponse($text) {
 
             '^s?_?sz' { '0' }
 
-            '^s?_?bj' { 'other' }
+            '^s?_?bj' { '0' }
 
             default { '1' }
 
@@ -252,11 +266,12 @@ function Fetch-Quotes-Sina($secids) {
 
         try {
 
-            $resp = Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -TimeoutSec 15
+            Write-FrameLog "fetch sina quotes n=$($secids.Count)"
+            $resp = Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -TimeoutSec 15 -DisableKeepAlive
 
             $bytes = $resp.RawContentStream.ToArray()
 
-            # 使用 gbk 解码（gb2312 的超集，更安兼�
+            # 使用 gbk 解码（gb2312 的超集，更安全兼容）
 
             $text = [System.Text.Encoding]::GetEncoding('gbk').GetString($bytes)
 
@@ -282,7 +297,7 @@ function Fetch-Quotes-Sina($secids) {
 
 function Format-Number($v, $digits = 2, $divisor = 1) {
 
-    # 注意：PowerShell �?0 -eq '' 会因类型强制而为 true，所以先轭�符串判断
+    # 注意：PowerShell 中 $null -eq '' 会因类型强制而为 true，所以先做字符串判断
 
     if ($v -eq $null) { return '-' }
 
@@ -317,9 +332,25 @@ function Format-Yi($v) {
 }
 
 
-function Format-WanYi($v) {
+function Format-Cap($v) {
 
-    try { return "{0:F2}" -f ([double]$v / 1e12) } catch { return '-' }
+    try {
+
+        $f = [double]$v
+
+        if ($f -ge 1e12) {
+
+            return ("{0:F3}" -f ($f / 1e12)), '万亿'
+
+        }
+
+        return ("{0:F2}" -f ($f / 1e8)), '亿'
+
+    } catch {
+
+        return '-', '亿'
+
+    }
 
 }
 
@@ -327,6 +358,44 @@ function Format-WanYi($v) {
 function Format-LatestVol($v) {
 
     try { return "{0:N0}" -f ([math]::Abs([double]$v)) } catch { return '-' }
+
+}
+
+
+function Format-AvgPrice($row, $amt = $null, $vol = $null) {
+
+    try {
+
+        if ($amt -eq $null -or "$amt" -eq '' -or "$amt" -eq '-') { $amt = $row.f6 }
+
+        if ($vol -eq $null -or "$vol" -eq '' -or "$vol" -eq '-') { $vol = $row.f5 }
+
+        $amt = [double]$amt
+
+        $vol = [double]$vol
+
+        if ($vol -le 0) { return '-' }
+
+        $digits = if (Test-IsETF $row) { 3 } else { 2 }
+
+        return "{0:N$digits}" -f ($amt / ($vol * 100))
+
+    } catch { return '-' }
+
+}
+
+
+function Format-PricePctPair($price, $pct, $totalWidth = 16, $minGap = 3) {
+
+    $priceStr = "$price"
+
+    $pctStr = "$pct"
+
+    $available = $totalWidth - (Measure-DisplayWidth $priceStr) - (Measure-DisplayWidth $pctStr)
+
+    $gap = if ($available -ge $minGap) { $minGap } else { [Math]::Max(1, $available) }
+
+    return $priceStr + (' ' * $gap) + $pctStr
 
 }
 
@@ -355,6 +424,8 @@ function Measure-DisplayWidth($s) {
 
 function Pad-Right($s, $width) {
 
+    $s = Truncate-ToWidth $s $width
+
     $pad = $width - (Measure-DisplayWidth $s)
 
     if ($pad -lt 0) { $pad = 0 }
@@ -364,6 +435,8 @@ function Pad-Right($s, $width) {
 }
 
 function Pad-Left($s, $width) {
+
+    $s = Truncate-ToWidth $s $width
 
     $pad = $width - (Measure-DisplayWidth $s)
 
@@ -403,11 +476,59 @@ function Truncate-Name($s, $maxWidth = 8) {
 
 }
 
+function Truncate-ToWidth($s, $maxWidth) {
+
+    $str = "$s"
+
+    $w = 0
+
+    $result = ""
+
+    foreach ($c in $str.ToCharArray()) {
+
+        $cw = if ([int]$c -gt 127) { 2 } else { 1 }
+
+        if ($w + $cw -le $maxWidth) {
+
+            $w += $cw
+
+            $result += $c
+
+        } else {
+
+            break
+
+        }
+
+    }
+
+    return $result
+
+}
+
 # ---------- 缓存：name -> secid ----------
 
 $script:secidCachePath = Join-Path $PSScriptRoot '.secids_cache.json'
 
 $script:secidCache = @{}
+
+function Write-JsonFile($path, $data) {
+    # 统一缓存格式：UTF-8 无 BOM、临时文件原子替换，供 macOS/Linux Python 版共用。
+    try {
+        $json = $data | ConvertTo-Json -Depth 8
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $tmp = "$path.tmp"
+        [System.IO.File]::WriteAllText($tmp, $json, $utf8)
+        if (Test-Path -LiteralPath $path) {
+            [System.IO.File]::Replace($tmp, $path, $null)
+        } else {
+            [System.IO.File]::Move($tmp, $path)
+        }
+    } catch {
+        # Replace 在个别文件系统上可能失败，退回到 Move-Item
+        try { Move-Item -LiteralPath $tmp -Destination $path -Force } catch {}
+    }
+}
 
 function Load-SecidCache {
 
@@ -437,7 +558,7 @@ function Save-SecidCache {
 
     try {
 
-        $script:secidCache | ConvertTo-Json | Set-Content $script:secidCachePath -Encoding UTF8
+        Write-JsonFile $script:secidCachePath $script:secidCache
 
     } catch {
 
@@ -455,9 +576,9 @@ $script:hyCache = @{}              # secid -> @{ pct; date }
 
 $script:hyUpdateJob = $null        # background update job
 
-$script:hyStartInterval = 0        # 半年涨跌�始刷新的间隔（��?
+$script:hyStartInterval = 0        # 半年涨跌开始刷新的间隔（秒）
 
-$script:nextHyStartTime = $null    # 下��始半年涨跌刷新的时间
+$script:nextHyStartTime = $null    # 下次开始半年涨跌刷新的时间
 
 function Load-HyCache {
 
@@ -487,7 +608,7 @@ function Save-HyCache {
 
     try {
 
-        $script:hyCache | ConvertTo-Json | Set-Content $script:hyCachePath -Encoding UTF8
+        Write-JsonFile $script:hyCachePath $script:hyCache
 
     } catch {
 
@@ -497,7 +618,7 @@ function Save-HyCache {
 
 }
 
-# ---------- 缓存：三市成交�� ----------
+# ---------- 缓存：三市成交额 ----------
 
 $script:marketTotalCachePath = Join-Path $PSScriptRoot '.market_total_cache.json'
 
@@ -541,7 +662,7 @@ function Save-MarketTotalCache {
 
     try {
 
-        $script:marketTotalCache | ConvertTo-Json | Set-Content $script:marketTotalCachePath -Encoding UTF8
+        Write-JsonFile $script:marketTotalCachePath $script:marketTotalCache
 
     } catch {
 
@@ -551,11 +672,357 @@ function Save-MarketTotalCache {
 
 }
 
-# ---------- 展示层缓存（�?secid 存储，避免刷新间隙空白） ----------
+# ---------- 缓存：日均线 ----------
+
+$script:maCachePath = Join-Path $PSScriptRoot '.ma_cache.json'
+
+$script:maCache = @{}   # secid -> @{ date; ma10; ma20; ma30; ma250 }
+
+function Load-MaCache {
+
+    if (Test-Path $script:maCachePath) {
+
+        try {
+
+            $json = Get-Content $script:maCachePath -Encoding UTF8 | ConvertFrom-Json
+
+            foreach ($p in $json.PSObject.Properties) {
+
+                $script:maCache[$p.Name] = $p.Value
+
+            }
+
+        } catch {
+
+            # 缓存损坏时忽略，重新计算
+
+        }
+
+    }
+
+}
+
+function Save-MaCache {
+
+    try {
+
+        Write-JsonFile $script:maCachePath $script:maCache
+
+    } catch {
+
+        # 保存失败不影响主流程
+
+    }
+
+}
+
+$script:depthCachePath = Join-Path $PSScriptRoot '.depth_cache.json'
+
+$script:depthCache = @{}
+
+$script:depthUpdateJob = $null
+
+$script:depthJobSecid = $null
+
+$script:depthPending = $null
+
+function Load-DepthCache {
+
+    if (Test-Path $script:depthCachePath) {
+
+        try {
+
+            $json = Get-Content $script:depthCachePath -Encoding UTF8 | ConvertFrom-Json
+
+            foreach ($p in $json.PSObject.Properties) {
+
+                $script:depthCache[$p.Name] = $p.Value
+
+            }
+
+        } catch {
+
+            # 缓存损坏时忽略，重新获取
+
+        }
+
+    }
+
+    Clear-StaleDepthCache
+
+}
+
+function Save-DepthCache {
+
+    try {
+
+        Write-JsonFile $script:depthCachePath $script:depthCache
+
+    } catch {
+
+        # 保存失败不影响主流程
+
+    }
+
+}
+
+# 只保留当天缓存，避免磁盘无限增长
+
+function Clear-StaleDepthCache {
+
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+
+    $stale = @($script:depthCache.Keys | Where-Object { $script:depthCache[$_].date -ne $today })
+
+    foreach ($k in $stale) { $script:depthCache.Remove($k) }
+
+}
+
+function Fetch-DailyKlines($secid, $limit = 300) {
+
+    # 获取日线收盘价序列（f53=收盘），用于计算日均线
+
+    try {
+
+        $url = (
+
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get?" +
+
+            "secid=$secid&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&" +
+
+            "fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&" +
+
+            "klt=101&fqt=0&end=20500101&lmt=$limit"
+
+        )
+
+        $data = Fetch-Json $url 15
+
+        $klines = $data.data.klines
+
+        if ($klines -eq $null -or $klines.Count -eq 0) { return @() }
+
+        $closes = @()
+
+        foreach ($k in $klines) {
+
+            $parts = $k.Split(',')
+
+            if ($parts.Count -ge 3) {
+
+                $closes += [double]$parts[2]
+
+            }
+
+        }
+
+        return $closes
+
+    } catch {
+
+        return @()
+
+    }
+
+}
+
+function Get-DailyMAs($secid) {
+
+    # 只读当天缓存，不触发网络；缺失时启动后台补齐并返回 $null（对应区块暂不显示）
+
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+
+    $cached = $script:maCache[$secid]
+
+    if ($cached -ne $null -and $cached.date -eq $today) {
+
+        if ($cached.ma10 -ne $null -or $cached.ma20 -ne $null -or $cached.ma30 -ne $null -or
+            $cached.ma120 -ne $null -or $cached.ma250 -ne $null) {
+
+            return $cached
+
+        }
+
+        return $null
+
+    }
+
+    Start-MaUpdate @($secid)
+
+    return $null
+
+}
+
+$script:maUpdateJob = $null
+
+$script:maUpdateJobScript = {
+
+    param($secids)
+
+    $secids = @($secids | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+
+    # 后台串行计算日均线，网络与计算都在子进程，不阻塞界面
+
+    $headers = @{
+
+        'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+
+        'Referer'    = 'https://quote.eastmoney.com/'
+
+    }
+
+    $result = @{}
+
+    foreach ($secid in $secids) {
+
+        try {
+
+            $url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?" +
+
+                "secid=$secid&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&" +
+
+                "fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&" +
+
+                "klt=101&fqt=0&end=20500101&lmt=300")
+
+
+            $resp = Invoke-RestMethod -Uri $url -TimeoutSec 15 -UseBasicParsing -Headers $headers
+
+            $klines = $resp.data.klines
+
+            if ($klines -eq $null -or $klines.Count -lt 10) { continue }
+
+            $closes = @()
+
+            foreach ($k in $klines) {
+
+                $parts = $k.Split(',')
+
+                if ($parts.Count -ge 3) { $closes += [double]$parts[2] }
+
+            }
+
+            if ($closes.Count -lt 10) { continue }
+
+            $entry = @{ date = (Get-Date).ToString('yyyy-MM-dd') }
+
+            foreach ($period in @(10, 20, 30, 120, 250)) {
+
+                if ($closes.Count -ge $period) {
+
+                    $sum = 0.0
+
+                    for ($i = $closes.Count - $period; $i -lt $closes.Count; $i++) { $sum += $closes[$i] }
+
+                    $entry["ma$period"] = [math]::Round($sum / $period, 2)
+
+                }
+
+            }
+
+            $result[$secid] = $entry
+
+        } catch {}
+
+    }
+
+    return $result
+
+}
+
+function Start-MaUpdate($secids) {
+
+    if ($script:maUpdateJob -ne $null -and $script:maUpdateJob.State -eq 'Running') { return }
+
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+
+    $toUpdate = @()
+
+    foreach ($secid in $secids) {
+
+        $cached = $script:maCache[$secid]
+
+        if ($cached -eq $null -or $cached.date -ne $today) { $toUpdate += $secid }
+
+    }
+
+    if ($toUpdate.Count -eq 0) { return }
+
+    $script:maUpdateJob = Start-Job -ScriptBlock $script:maUpdateJobScript -ArgumentList (,$toUpdate)
+
+}
+
+function Complete-MaUpdate {
+
+    if ($script:maUpdateJob -eq $null) { return $false }
+
+    if ($script:maUpdateJob.State -in @('Completed', 'Failed')) {
+
+        $updated = $false
+
+        if ($script:maUpdateJob.State -eq 'Completed') {
+
+            $result = Receive-Job $script:maUpdateJob
+
+            if ($result -ne $null) {
+
+                foreach ($secid in $result.Keys) {
+
+                    $script:maCache[$secid] = $result[$secid]
+
+                }
+
+                Save-MaCache
+
+                $updated = $true
+
+            }
+
+        }
+
+        Remove-Job $script:maUpdateJob -Force -ErrorAction SilentlyContinue
+
+        $script:maUpdateJob = $null
+
+        return $updated
+
+    }
+
+    return $false
+
+}
+
+# ---------- 展示层缓存（按 secid 存储，避免刷新间隙空白） ----------
 
 $script:stockQuoteCache = @{}   # secid -> row
 
 $script:indexQuoteCache = @{}   # secid -> row
+
+function Is-MissingValue($v) {
+
+    return $v -eq $null -or "$v" -eq '' -or "$v" -eq '-'
+
+}
+
+function Merge-Row($oldRow, $newRow) {
+
+    if ($oldRow -eq $null) { return $newRow }
+
+    $merged = $oldRow | Select-Object *
+
+    foreach ($prop in $newRow.PSObject.Properties) {
+
+        if (-not (Is-MissingValue $prop.Value)) {
+
+            $merged | Add-Member -MemberType NoteProperty -Name $prop.Name -Value $prop.Value -Force
+
+        }
+
+    }
+
+    return $merged
+
+}
 
 function Update-Caches($rows) {
 
@@ -567,13 +1034,15 @@ function Update-Caches($rows) {
 
         $secid = "$($r.f13).$($r.f12)"
 
+        $script:quoteSuccessTimes[$secid] = Get-Date
+
         if ($indexSet.ContainsKey($secid)) {
 
-            $script:indexQuoteCache[$secid] = $r
+            $script:indexQuoteCache[$secid] = Merge-Row $script:indexQuoteCache[$secid] $r
 
         } else {
 
-            $script:stockQuoteCache[$secid] = $r
+            $script:stockQuoteCache[$secid] = Merge-Row $script:stockQuoteCache[$secid] $r
 
         }
 
@@ -583,7 +1052,7 @@ function Update-Caches($rows) {
 
 function Get-CachedRows($cache, $secids) {
 
-    # �?watchlist.json 业� secid 顺序返回，避�?Hashtable 打乱顺序
+    # 按 watchlist.json 业务 secid 顺序返回，避免 Hashtable 打乱顺序
 
     $rows = @()
 
@@ -598,6 +1067,20 @@ function Get-CachedRows($cache, $secids) {
     }
 
     return $rows
+
+}
+
+function Test-QuoteStale($row) {
+
+    $secid = "$($row.f13).$($row.f12)"
+
+    $success = $script:quoteSuccessTimes[$secid]
+
+    if ($success -eq $null) { return $true }
+
+    $limit = [math]::Max(90, $interval * 3)
+
+    return ((Get-Date) - [DateTime]$success).TotalSeconds -gt $limit
 
 }
 
@@ -627,7 +1110,7 @@ function Apply-HalfYearPct($rows) {
 
 function Search-SecIds($names) {
 
-    $secids = @()
+    $resolved = @{}
 
     $missing = @()
 
@@ -635,7 +1118,7 @@ function Search-SecIds($names) {
 
         if ($script:secidCache.ContainsKey($name)) {
 
-            $secids += $script:secidCache[$name]
+            $resolved[$name] = $script:secidCache[$name]
 
         } else {
 
@@ -645,57 +1128,43 @@ function Search-SecIds($names) {
 
     }
 
-    if ($missing.Count -gt 0) {
+    foreach ($name in $missing) {
 
-        foreach ($name in $missing) {
+        try {
 
-            try {
+            $encoded = [Uri]::EscapeDataString($name)
 
-                $encoded = [System.Web.HttpUtility]::UrlEncode($name)
+            $data = Fetch-Json "https://searchapi.eastmoney.com/api/suggest/get?input=$encoded&type=14&count=5" 10
 
-                $url = "https://searchapi.eastmoney.com/api/suggest/get?input=$encoded&type=14&count=5"
+            $item = @($data.QuotationCodeTable.Data | Where-Object { $_.Name -eq $name } | Select-Object -First 1)
 
-                $data = Fetch-Json $url 10
+            if ($item.Count -gt 0) {
 
-                $items = $data.QuotationCodeTable.Data
+                $resolved[$name] = $item[0].QuoteID
 
-                $item = $null
+                $script:secidCache[$name] = $item[0].QuoteID
 
-                foreach ($it in $items) {
+            } else {
 
-                    if ($it.Name -eq $name) {
-
-                        $item = $it
-
-                        break
-
-                    }
-
-                }
-
-                if ($item -eq $null -and $items.Count -gt 0) {
-
-                    $item = $items[0]
-
-                }
-
-                if ($item -ne $null) {
-
-                    $script:secidCache[$name] = $item.QuoteID
-
-                    $secids += $item.QuoteID
-
-                }
-
-            } catch {
-
-                continue
+                Write-FrameLog "security not matched exactly: $name"
 
             }
 
+        } catch {
+
+            Write-FrameLog "security search failed: $name : $_"
+
         }
 
-        Save-SecidCache
+    }
+
+    if ($missing.Count -gt 0) { Save-SecidCache }
+
+    $secids = @()
+
+    foreach ($name in $names) {
+
+        if ($resolved.ContainsKey($name)) { $secids += $resolved[$name] }
 
     }
 
@@ -703,11 +1172,11 @@ function Search-SecIds($names) {
 
 }
 
-function Fetch-AllQuotes($secids, $stealth) {
+function Fetch-AllQuotes($secids, $stealth, $quiet = $false, $timeout = 15) {
 
     if ($secids.Count -eq 0) { return @() }
 
-    # 1) 主数捺�：东方财�?
+    # 1) 主数据源：东方财富
 
     try {
 
@@ -717,7 +1186,9 @@ function Fetch-AllQuotes($secids, $stealth) {
 
         $url = "https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=$fields&secids=$secidStr"
 
-        $data = Fetch-Json $url 15 2
+        Write-FrameLog "fetch eastmoney quotes n=$($secids.Count)"
+
+        $data = Fetch-Json $url $timeout 2
 
         if ($data.data.diff.Count -gt 0) {
 
@@ -727,7 +1198,11 @@ function Fetch-AllQuotes($secids, $stealth) {
 
     } catch {
 
-        Write-Host "[warn] EastMoney quote fetch failed: $_" -ForegroundColor DarkGray
+        if (-not $quiet) {
+
+            Write-Host "[warn] EastMoney quote fetch failed: $_" -ForegroundColor DarkGray
+
+        }
 
     }
 
@@ -739,7 +1214,11 @@ function Fetch-AllQuotes($secids, $stealth) {
 
         if ($rows.Count -gt 0) {
 
-            Write-Host "[info] switched to Sina fallback ($($rows.Count)/$($secids.Count) symbols)" -ForegroundColor DarkGray
+            if (-not $quiet) {
+
+                Write-Host "[info] switched to Sina fallback ($($rows.Count)/$($secids.Count) symbols)" -ForegroundColor DarkGray
+
+            }
 
             return $rows
 
@@ -747,23 +1226,27 @@ function Fetch-AllQuotes($secids, $stealth) {
 
     } catch {
 
-        Write-Host "[warn] Sina quote fetch failed: $_" -ForegroundColor DarkGray
+        if (-not $quiet) {
+
+            Write-Host "[warn] Sina quote fetch failed: $_" -ForegroundColor DarkGray
+
+        }
 
     }
 
-    throw "�有�情数捺�均不叔�（东贁新浼�"
+    throw "所有行情数据源均不可用（东财、新浪）"
 
 }
 
 function Parse-SinaDepthResponse($text, $sinaCode, $name = $null) {
 
-    # 解析新浪盘口返回�?
+    # 解析新浪盘口返回内容
 
-    # var hq_str_sh688981="名称,今开,昨收,��?��?��?�?�?�?�?成交�?�?,成交�?
+    # 新浪盘口字段顺序（以 sh688981 为例）：
 
-    #                       �?�?�?�?�?�?�?�?...,�?�?�?�?
+    # 名称,今开,昨收,最新,最高,最低,竞买价,竞卖价,成交量(股),成交额,
 
-    #                       �?�?�?�?�?�?�?�?...,�?�?�?�?日期,时间,状�?;
+    # 买一到买五的价/量,卖一到卖五的价/量,日期,时间,状态
 
     if ($text -notmatch "var hq_str_$sinaCode=`"([^`"]*)`";") { return $null }
 
@@ -865,7 +1348,236 @@ function Parse-SinaDepthResponse($text, $sinaCode, $name = $null) {
 
 function Fetch-DepthData($secid, $name = $null) {
 
-    # 新浪提供完整五档 + 基�行情；东�?details 提供逐笔成交
+    # 新浪提供完整五档 + 基础行情；东财 details 提供逐笔成交
+
+    $sinaCode = Convert-SecidToSinaCode $secid
+
+    $sinaUrl = "https://hq.sinajs.cn/list=$sinaCode"
+
+    $sinaHeaders = @{
+
+        'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+
+        'Referer'    = 'https://finance.sina.com.cn'
+
+    }
+
+    try {
+
+        $sinaText = Invoke-RestMethod -Uri $sinaUrl -TimeoutSec 10 -UseBasicParsing -Headers $sinaHeaders -DisableKeepAlive
+
+    } catch {
+
+        # 新浪五档失败会导致盘口无法显示，这里保留错误提示但限制刷屏
+
+        Write-Host "[warn] sina depth fetch failed: 盘口数据源暂不可用" -ForegroundColor DarkGray
+
+        return $null
+
+    }
+
+    $d = Parse-SinaDepthResponse $sinaText $sinaCode $name
+
+    if ($d -eq $null) {
+
+        Write-Host "[warn] sina depth parse failed" -ForegroundColor DarkGray
+
+        return $null
+
+    }
+
+    # 东财逐笔成交（details/get 在 PS 5.1 下可正常访问）
+
+    try {
+
+        $dfUrl = "https://push2.eastmoney.com/api/qt/stock/details/get?secid=$secid&fields1=f1,f2,f3,f4&fields2=f51,f52,f53,f54"
+
+        $dfHeaders = @{
+
+            'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+            'Referer'    = 'https://quote.eastmoney.com/'
+
+            'Accept'     = 'application/json, text/javascript, */*; q=0.01'
+
+            'Accept-Language' = 'zh-CN,zh;q=0.9,en;q=0.8'
+
+        }
+
+        $df = $null
+        $dfErr = $null
+        for ($retry = 0; $retry -lt 3; $retry++) {
+            try {
+                $df = Invoke-RestMethod -Uri $dfUrl -TimeoutSec 10 -UseBasicParsing -Headers $dfHeaders -DisableKeepAlive
+                break
+            } catch {
+                $dfErr = $_
+                # 指数退避：300ms / 600ms
+                if ($retry -lt 2) {
+                    Start-Sleep -Milliseconds (300 * ($retry + 1))
+                }
+            }
+        }
+
+        if ($df -and $df.data -and $df.data.details -and $df.data.details.Count -gt 0) {
+
+            $last = $df.data.details[-1] -split ','
+
+            if ($last.Count -ge 3) {
+
+                $d | Add-Member -NotePropertyName 'last_trade_time'   -NotePropertyValue $last[0]       -Force
+
+                $d | Add-Member -NotePropertyName 'last_trade_price'  -NotePropertyValue ([double]$last[1]) -Force
+
+                $d | Add-Member -NotePropertyName 'last_trade_volume' -NotePropertyValue ([int]$last[2])    -Force
+
+            }
+
+        }
+
+    } catch {
+
+        # details/get 仅用于补充最新逐笔成交，失败不影响盘口主体（新浪五档）。
+
+        # 为避免该偶发网络警告反复刷屏，这里静默忽略；如需排查可在此加日志。
+
+    }
+
+    return $d
+
+}
+
+$script:depthJobScript = {
+
+    param($secid, $name)
+
+    # 后台取盘口：新浪五档 + 东财逐笔成交（独立进程运行，不阻塞界面）
+
+    function Convert-SecidToSinaCode($secid) {
+
+        $market = '0'; $code = $secid
+
+        if ($secid -match '^(\d+)\.(.+)$') {
+
+            $market = $matches[1]
+
+            $code = $matches[2]
+
+        }
+
+        $prefix = ''
+        if ($market -eq '1') {
+            if ($code -match '^000(001|688)$') { $prefix = 's_sh' } else { $prefix = 'sh' }
+        } elseif ($market -eq '0') {
+            if ($code -match '^899\d{3}$') { $prefix = 's_bj' }
+            elseif ($code -match '^(399|930)\d{3}$') { $prefix = 's_sz' }
+            elseif ($code -match '^(4|8|92)\d{4,5}$') { $prefix = 'bj' }
+            else { $prefix = 'sz' }
+        } else {
+            $prefix = 'bj'
+        }
+
+        return "$prefix$code"
+
+    }
+
+    function Parse-SinaDepthResponse($text, $sinaCode, $name = $null) {
+
+        if ($text -notmatch "var hq_str_$sinaCode=`"([^`"]*)`";") { return $null }
+
+        $parts = $matches[1] -split ','
+
+        if ($parts.Count -lt 33) { return $null }
+
+        function _num($idx) {
+
+            $v = $parts[$idx]
+
+            if ($v -eq $null -or $v -eq '' -or $v -eq '-') { return $null }
+
+            try { return [double]$v } catch { return $null }
+
+        }
+
+        function _vol($idx) {
+
+            $v = _num $idx
+
+            if ($v -eq $null) { return $null }
+
+            return [int]($v / 100)
+
+        }
+
+        $price = _num 3
+
+        $prev  = _num 2
+
+        $change = if ($price -ne $null -and $prev -ne $null) { [math]::Round($price - $prev, 4) } else { $null }
+
+        $pct = if ($change -ne $null -and $prev -ne $null -and $prev -ne 0) { [math]::Round($change / $prev * 100, 2) } else { $null }
+
+        $volShares = _num 8
+
+        $volume = if ($volShares -ne $null) { [math]::Floor($volShares / 100) } else { $null }
+
+        return [PSCustomObject]@{
+
+            name       = if ([string]::IsNullOrWhiteSpace($name)) { $parts[0] } else { $name }
+
+            code       = ($sinaCode -replace '^[a-z_]+', '')
+
+            price      = $price
+
+            prev_close = $prev
+
+            open       = _num 1
+
+            high       = _num 4
+
+            low        = _num 5
+
+            volume     = $volume
+
+            amount     = _num 9
+
+            turnover   = $null
+
+            change     = $change
+
+            pct_chg    = $pct
+
+            asks       = @(
+
+                , @((_num 21), (_vol 20))
+
+                , @((_num 23), (_vol 22))
+
+                , @((_num 25), (_vol 24))
+
+                , @((_num 27), (_vol 26))
+
+                , @((_num 29), (_vol 28))
+
+            )
+
+            bids       = @(
+
+                , @((_num 11), (_vol 10))
+
+                , @((_num 13), (_vol 12))
+
+                , @((_num 15), (_vol 14))
+
+                , @((_num 17), (_vol 16))
+
+                , @((_num 19), (_vol 18))
+
+            )
+
+        }
+
+    }
 
     $sinaCode = Convert-SecidToSinaCode $secid
 
@@ -885,23 +1597,15 @@ function Fetch-DepthData($secid, $name = $null) {
 
     } catch {
 
-        Write-Host "[warn] sina depth fetch failed: $_" -ForegroundColor DarkGray
-
         return $null
 
     }
 
     $d = Parse-SinaDepthResponse $sinaText $sinaCode $name
 
-    if ($d -eq $null) {
+    if ($d -eq $null) { return $null }
 
-        Write-Host "[warn] sina depth parse failed" -ForegroundColor DarkGray
-
-        return $null
-
-    }
-
-    # 东财逐笔成交（details/get �?PS 5.1 下可正常访问�?
+    # 东财逐笔成交（补充最新一笔，失败不影响主体）
 
     try {
 
@@ -909,15 +1613,33 @@ function Fetch-DepthData($secid, $name = $null) {
 
         $dfHeaders = @{
 
-            'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
             'Referer'    = 'https://quote.eastmoney.com/'
 
+            'Accept'     = 'application/json, text/javascript, */*; q=0.01'
+
         }
 
-        $df = Invoke-RestMethod -Uri $dfUrl -TimeoutSec 10 -UseBasicParsing -Headers $dfHeaders
+        $df = $null
 
-        if ($df.data -and $df.data.details -and $df.data.details.Count -gt 0) {
+        for ($retry = 0; $retry -lt 3; $retry++) {
+
+            try {
+
+                $df = Invoke-RestMethod -Uri $dfUrl -TimeoutSec 10 -UseBasicParsing -Headers $dfHeaders
+
+                break
+
+            } catch {
+
+                if ($retry -lt 2) { Start-Sleep -Milliseconds (300 * ($retry + 1)) }
+
+            }
+
+        }
+
+        if ($df -and $df.data -and $df.data.details -and $df.data.details.Count -gt 0) {
 
             $last = $df.data.details[-1] -split ','
 
@@ -933,13 +1655,133 @@ function Fetch-DepthData($secid, $name = $null) {
 
         }
 
-    } catch {
+    } catch {}
 
-        Write-Host "[warn] details fetch failed: $_" -ForegroundColor DarkGray
+    $d | Add-Member -NotePropertyName 'date' -NotePropertyValue (Get-Date).ToString('yyyy-MM-dd') -Force
+
+    $d | Add-Member -NotePropertyName 'fetched_at' -NotePropertyValue (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') -Force
+
+    return [PSCustomObject]@{ secid = $secid; depth = $d }
+
+}
+
+function Start-DepthUpdate($secid, $name) {
+
+    if ([string]::IsNullOrEmpty($secid)) { return $false }
+
+    if ($script:depthUpdateJob -ne $null) {
+
+        if ($script:depthJobSecid -ne $secid) {
+
+            $script:depthPending = @{ secid = $secid; name = $name }
+
+        }
+
+        return $false
 
     }
 
-    return $d
+    $script:depthPending = $null
+
+    $script:depthJobSecid = $secid
+
+    $script:depthUpdateJob = Start-Job -ScriptBlock $script:depthJobScript -ArgumentList $secid, $name
+
+    return $true
+
+}
+
+function Complete-DepthUpdate {
+
+    if ($script:depthUpdateJob -eq $null) { return $false }
+
+    if ($script:depthUpdateJob.State -notin @('Completed', 'Failed')) { return $false }
+
+    $updated = $false
+
+    if ($script:depthUpdateJob.State -eq 'Completed') {
+
+        $result = Receive-Job $script:depthUpdateJob
+
+        if ($result -ne $null -and $result.depth -ne $null) {
+
+            $script:depthCache[$result.secid] = $result.depth
+
+            Save-DepthCache
+
+            $updated = $true
+
+        }
+
+    }
+
+    Remove-Job $script:depthUpdateJob -Force -ErrorAction SilentlyContinue
+
+    $script:depthUpdateJob = $null
+
+    $script:depthJobSecid = $null
+
+    if ($script:depthPending -ne $null) {
+
+        $pending = $script:depthPending
+
+        $script:depthPending = $null
+
+        [void](Start-DepthUpdate $pending.secid $pending.name)
+
+        $updated = $true
+
+    }
+
+    return $updated
+
+}
+
+function Get-DepthSkeleton($row) {
+
+    # 用列表行情字段构造盘口骨架：标题与左侧立即成型，五档留空等待后台数据
+
+    $pairs = @()
+
+    for ($i = 0; $i -lt 5; $i++) { $pairs += ,@($null, $null) }
+
+    return [PSCustomObject]@{
+
+        name       = $row.f14
+
+        code       = $row.f12
+
+        price      = $row.f2
+
+        prev_close = $row.f18
+
+        open       = $row.f17
+
+        high       = $row.f15
+
+        low        = $row.f16
+
+        volume     = $null
+
+        amount     = $null
+
+        turnover   = $null
+
+        change     = $row.f4
+
+        pct_chg    = $row.f3
+
+        asks       = $pairs
+
+        bids       = $pairs
+
+        last_trade_time   = $null
+
+        last_trade_price  = $null
+
+        last_trade_volume = $null
+
+    }
 
 }
 
@@ -963,7 +1805,7 @@ function Get-HalfYearPct($secid) {
 
         } catch {
 
-            Write-Host "[warn] kline date parse failed for $secid : $_" -ForegroundColor DarkGray
+            Write-WarnLine "[warn] kline date parse failed for $secid : $_"
 
             return $null
 
@@ -1005,7 +1847,7 @@ function Get-HalfYearPct($secid) {
 
 function Fetch-IndexKlineAmounts($secid, $days = 20) {
 
-    # 获取指数日线成交额历史（f51=日期, f57=成交额）�?
+    # 获取指数日线成交额历史（f51=日期, f57=成交额）
 
     try {
 
@@ -1051,7 +1893,7 @@ function Fetch-IndexKlineAmounts($secid, $days = 20) {
 
     } catch {
 
-        Write-Host "[warn] market total kline fetch failed for $secid : $_" -ForegroundColor DarkGray
+                    Write-WarnLine "[warn] market total kline fetch failed for $secid : $_"
 
         return @()
 
@@ -1061,7 +1903,7 @@ function Fetch-IndexKlineAmounts($secid, $days = 20) {
 
 function Get-TradingElapsedMinutes($timeStr) {
 
-    # 计算从开盘到指定时刻的累计交易分钟数（A�?09:30-11:30, 13:00-15:00，共240分钟）�?
+    # 计算从开盘到指定时刻的累计交易分钟数（A股 09:30-11:30, 13:00-15:00，共240分钟）
 
     $parts = $timeStr.Split(':')
 
@@ -1091,11 +1933,97 @@ function Get-TradingElapsedMinutes($timeStr) {
 
 }
 
+$script:marketTotalJob = $null
+
+$script:marketNextRetry = [DateTime]::MinValue
+
+$script:marketHistoryRefreshDate = ''
+
+$script:marketHistoryReady = $false
+
+function Start-MarketTotalUpdate($secids) {
+
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+
+    if ($script:marketTotalJob -ne $null -or $script:marketHistoryRefreshDate -eq $today -or
+        (Get-Date) -lt $script:marketNextRetry) { return $false }
+
+    $script:marketHistoryRefreshDate = $today
+
+    $worker = Join-Path $PSScriptRoot 'market_worker.ps1'
+
+    $script:marketTotalJob = Start-Job -ScriptBlock {
+        param($path, $ids)
+        & $path -Secids $ids
+    } -ArgumentList $worker, ($secids -join ',')
+
+    return $true
+
+}
+
+function Complete-MarketTotalUpdate {
+
+    if ($script:marketTotalJob -eq $null -or $script:marketTotalJob.State -notin @('Completed', 'Failed')) { return $false }
+
+    $received = $false
+
+    $freshCount = 0
+
+    if ($script:marketTotalJob.State -eq 'Completed') {
+
+        $result = Receive-Job $script:marketTotalJob
+
+        if ($result -ne $null) {
+
+            foreach ($secid in $result.Keys) {
+
+                if ($result[$secid].Count -gt 0) {
+
+                    if ($script:marketTotalCache[$secid] -eq $null) { $script:marketTotalCache[$secid] = @{} }
+
+                    foreach ($item in $result[$secid]) { $script:marketTotalCache[$secid][$item[0]] = $item[1] }
+
+                    $received = $true
+
+                    $freshCount++
+
+                }
+
+            }
+
+        }
+
+    }
+
+    Remove-Job $script:marketTotalJob -Force -ErrorAction SilentlyContinue
+
+    $script:marketTotalJob = $null
+
+    # 今天没刷新成功时，只要缓存里三个市场都有足够历史数据，就继续显示
+    $cachedDays = 999999
+    foreach ($secid in @('1.000001', '0.399001', '0.899050')) {
+        $days = 0
+        $entry = $script:marketTotalCache[$secid]
+        if ($entry -ne $null) { $days = $entry.Count }
+        if ($days -lt $cachedDays) { $cachedDays = $days }
+    }
+    $script:marketHistoryReady = (($freshCount -eq 3) -or ($cachedDays -ge 6))
+
+    if ($received) { Save-MarketTotalCache }
+
+    $script:marketNextRetry = (Get-Date).AddSeconds($(if ($received) { 0 } else { 60 }))
+
+    if (-not $script:marketHistoryReady) { $script:marketHistoryRefreshDate = '' }
+
+    return $received
+
+}
+
 function Get-MarketTotalAmounts($indexRows) {
 
-    # 计算沷�亸�市场今日成交总�及量比�?
+    # 计算沪深京三市场今日成交总额及量比
 
-    # 量比 = (今日�成交�?/ 已交易分钟数) / (过去5日日均成交� / 240)�?
+    # 量比 = (今日累计成交额 / 已交易分钟数) / (过去5日日均成交额 / 240)
 
     $marketSecids = [ordered]@{
 
@@ -1107,9 +2035,13 @@ function Get-MarketTotalAmounts($indexRows) {
 
     }
 
-    $secidList = $marketSecids.Values
+    $secidList = @($marketSecids.Values)
 
-    # 从已有指数�情中提取今日成交�?
+    [void](Start-MarketTotalUpdate $secidList)
+
+    if (-not $script:marketHistoryReady) { return $null }
+
+    # 从已有指数行情中提取今日成交额
 
     $todayAmounts = @{}
 
@@ -1141,67 +2073,45 @@ function Get-MarketTotalAmounts($indexRows) {
 
     }
 
-    # 加载/刷新日线成交额缓�?
+    $today = Get-Date
 
-    Load-MarketTotalCache
+    if ($today.DayOfWeek -in @([DayOfWeek]::Saturday, [DayOfWeek]::Sunday)) { return $null }
 
-    $todayStr = (Get-Date).ToString('yyyy-MM-dd')
+    $todayStr = $today.ToString('yyyy-MM-dd')
 
-    $needSave = $false
-
-    foreach ($secid in $secidList) {
-
-        if ($script:marketTotalCache[$secid] -eq $null) {
-
-            $script:marketTotalCache[$secid] = @{}
-
-        }
-
-        $cache = $script:marketTotalCache[$secid]
-
-        $beforeToday = $cache.Keys | Where-Object { $_ -lt $todayStr }
-
-        if ($beforeToday.Count -lt 5) {
-
-            $klines = Fetch-IndexKlineAmounts $secid 20
-
-            foreach ($k in $klines) {
-
-                $cache[$k[0]] = $k[1]
-
-            }
-
-            $needSave = $true
-
-        }
-
-    }
-
-    if ($needSave) { Save-MarketTotalCache }
-
-    # 计算过去5为�易日三市场合计日均成交�
-
-    $totalByDay = @(0.0, 0.0, 0.0, 0.0, 0.0)
-
-    $valid = $true
+    $commonDates = $null
 
     foreach ($secid in $secidList) {
 
         $cache = $script:marketTotalCache[$secid]
 
-        $dates = @($cache.Keys | Where-Object { $_ -lt $todayStr } | Sort-Object -Descending | Select-Object -First 5)
+        $dates = @($(if ($cache -ne $null) { $cache.Keys | Where-Object { $_ -lt $todayStr } } else { @() }))
 
-        if ($dates.Count -lt 5) { $valid = $false; break }
-
-        for ($i = 0; $i -lt 5; $i++) {
-
-            $totalByDay[$i] += $cache[$dates[$i]]
-
-        }
+        $commonDates = @($(if ($commonDates -eq $null) { $dates } else { $commonDates | Where-Object { $_ -in $dates } }))
 
     }
 
-    if (-not $valid) { return $null }
+    $commonDates = @($commonDates | Sort-Object -Descending | Select-Object -First 5)
+
+    if ($commonDates.Count -lt 5) {
+
+        [void](Start-MarketTotalUpdate $secidList)
+
+        return $null
+
+    }
+
+    $totalByDay = @()
+
+    foreach ($date in $commonDates) {
+
+        $sum = 0.0
+
+        foreach ($secid in $secidList) { $sum += [double]$script:marketTotalCache[$secid][$date] }
+
+        $totalByDay += $sum
+
+    }
 
     $avg = ($totalByDay | Measure-Object -Average).Average
 
@@ -1229,7 +2139,7 @@ function Get-MarketTotalAmounts($indexRows) {
 
 }
 
-# ---------- 数据组� ----------
+# ---------- 数据组织 ----------
 
 function Get-Quotes($stealth) {
 
@@ -1251,7 +2161,7 @@ function Get-Quotes($stealth) {
 
     }
 
-    # 合并�次�求，减少接口调用
+    # 合并单次请求，减少接口调用
 
     $allSecids = @($stockSecids) + @($indexSecids)
 
@@ -1307,6 +2217,56 @@ $script:chunkInterval = 0
 
 $script:nextChunkTime = $null
 
+$script:quoteUpdateJob = $null
+
+$script:quoteStatus = ''
+
+$script:quoteRequestedCount = 0
+
+$script:lastQuoteSuccess = $null
+
+$script:quoteSuccessTimes = @{}
+
+function Start-QuoteUpdate($secids, $stealth, $timeout = 5) {
+    if ($secids.Count -eq 0 -or $script:quoteUpdateJob -ne $null) { return $false }
+    $fields = if ($stealth) { $STEALTH_FIELDS } else { $FULL_FIELDS }
+    $worker = Join-Path $PSScriptRoot 'quote_worker.ps1'
+    $script:quoteRequestedCount = $secids.Count
+    $script:quoteUpdateJob = Start-Job -ScriptBlock {
+        param($path, $ids, $fieldSet, $timeoutSec)
+        & $path -Secids $ids -Fields $fieldSet -Timeout $timeoutSec
+    } -ArgumentList $worker, ($secids -join ','), $fields, $timeout
+    $script:quoteStatus = 'refreshing'
+    return $true
+}
+
+function Complete-QuoteUpdate {
+    if ($script:quoteUpdateJob -eq $null) { return $false }
+    if ($script:quoteUpdateJob.State -notin @('Completed', 'Failed')) { return $false }
+    $updated = $false
+    if ($script:quoteUpdateJob.State -eq 'Completed') {
+        $result = Receive-Job $script:quoteUpdateJob
+        if ($result -ne $null) {
+            $rows = @($result.Rows)
+            if ($rows.Count -gt 0) {
+                Update-Caches $rows
+                $script:lastQuoteSuccess = [DateTime]$result.CompletedAt
+                $script:quoteStatus = if ($rows.Count -lt $script:quoteRequestedCount) { 'partial data; missing symbols kept cached' } else { '' }
+                $updated = $true
+            } elseif ($result.Error) {
+                $script:quoteStatus = 'refresh failed; showing cached data'
+                $updated = $true
+            }
+        }
+    } else {
+        $script:quoteStatus = 'refresh failed; showing cached data'
+        $updated = $true
+    }
+    Remove-Job $script:quoteUpdateJob -Force -ErrorAction SilentlyContinue
+    $script:quoteUpdateJob = $null
+    return $updated
+}
+
 function Initialize-Quotes($stealth) {
 
     $scriptDir = $PSScriptRoot
@@ -1327,13 +2287,13 @@ function Initialize-Quotes($stealth) {
 
     }
 
-    # 首�全量拉取，填满缓�?
+    # 首次全量拉取，填满缓存（静默，避免警告信息破坏界面）
 
     $allSecids = @($script:stockSecids) + @($script:indexSecids)
 
     try {
 
-        $allRows = @(Fetch-AllQuotes $allSecids $stealth)
+        $allRows = @(Fetch-AllQuotes $allSecids $stealth $true)
 
     } catch {
 
@@ -1341,15 +2301,31 @@ function Initialize-Quotes($stealth) {
 
     }
 
-    $script:stockQuoteCache = @{}
-
-    $script:indexQuoteCache = @{}
-
     Update-Caches $allRows
 
-    # 计算分块参数：希望每块间隔约 3 秒，但至�?1 块�不超过股票总数�?
+    $script:lastQuoteSuccess = Get-Date
 
-    # 保证 totalChunks * chunkInterval == interval，即�丈�新周期内正好把所有股票更新一遍�?
+    $script:quoteStatus = ''
+
+    # 清理已不在当前 watchlist 中的旧缓存条目，保留仍有效的历史字段（如 VolR/Turn%）
+
+    $validSecids = @{}
+
+    foreach ($s in $script:stockSecids) { $validSecids[$s] = $true }
+
+    foreach ($s in $script:indexSecids) { $validSecids[$s] = $true }
+
+    $staleStock = $script:stockQuoteCache.Keys | Where-Object { -not $validSecids.ContainsKey($_) }
+
+    $staleIndex = $script:indexQuoteCache.Keys | Where-Object { -not $validSecids.ContainsKey($_) }
+
+    foreach ($k in $staleStock) { $script:stockQuoteCache.Remove($k) }
+
+    foreach ($k in $staleIndex) { $script:indexQuoteCache.Remove($k) }
+
+    # 计算分块参数：希望每块间隔约 3 秒，但至少 1 块且不超过股票总数
+
+    # 保证 totalChunks * chunkInterval == interval，即每次刷新周期内正好把所有股票更新一遍
 
     $desiredChunkInterval = 3
 
@@ -1385,11 +2361,11 @@ function Initialize-Quotes($stealth) {
 
     $script:nextChunkTime = (Get-Date).AddSeconds($script:chunkInterval)
 
-    # 初�化半年涨跌刷新�划：间隔为自动刷新间隔的 4 倍�?
+    # 初始化半年涨跌刷新计划：间隔为自动刷新间隔的 4 倍
 
-    # 若当天已有缓存则按�划等待；若缓存缺�?过期则立即在首�徎�吊�后台更新�?
+    # 若当天已有缓存则按计划等待；若缓存缺失/过期则立即在首次轮询后后台更新
 
-    # 保证先展示缓存数捼�再尽忡�齐真实数�?
+    # 保证先展示缓存数据，再尽快补齐真实数据
 
     $script:hyStartInterval = $interval * 4
 
@@ -1421,33 +2397,23 @@ function Initialize-Quotes($stealth) {
 
     }
 
+    # 启动后台错时抓取 PE/PB（只补当天缺失的缓存，不会阻塞界面）
+
+    Start-PepbUpdate $script:stockSecids
+
     return $null
 
 }
 
 function Update-NextChunk($stealth) {
 
+    if ($script:quoteUpdateJob -ne $null) { return }
+
     $stockCount = $script:stockSecids.Count
 
     if ($stockCount -eq 0) {
 
-        # 叜�指数时，按固�?interval 刷新指数
-
-        if ($script:indexSecids.Count -gt 0) {
-
-            try {
-
-                $rows = @(Fetch-AllQuotes $script:indexSecids $stealth)
-
-                Update-Caches $rows
-
-            } catch {
-
-                Write-Host "[warn] index refresh failed: $_" -ForegroundColor DarkGray
-
-            }
-
-        }
+        [void](Start-QuoteUpdate $script:indexSecids $stealth 5)
 
         $script:nextChunkTime = (Get-Date).AddSeconds($interval)
 
@@ -1461,9 +2427,7 @@ function Update-NextChunk($stealth) {
 
     $end = [math]::Min($start + $script:chunkSize, $stockCount)
 
-    $chunkSecids = $script:stockSecids[$start..($end - 1)]
-
-    # 每轮笸�块顺带刷新指�?
+    $chunkSecids = @($script:stockSecids[$start..($end - 1)])
 
     $allSecids = @($chunkSecids)
 
@@ -1473,27 +2437,13 @@ function Update-NextChunk($stealth) {
 
     }
 
-    try {
+    if (Start-QuoteUpdate $allSecids $stealth 5) {
 
-        $rows = @(Fetch-AllQuotes $allSecids $stealth)
+        $script:chunkIndex = ($script:chunkIndex + 1) % $totalChunks
 
-        Update-Caches $rows
-
-    } catch {
-
-        Write-Host "[warn] chunk $($script:chunkIndex + 1)/$totalChunks fetch failed: $_" -ForegroundColor DarkGray
+        $script:nextChunkTime = (Get-Date).AddSeconds($script:chunkInterval)
 
     }
-
-    $script:chunkIndex++
-
-    if ($script:chunkIndex -ge $totalChunks) {
-
-        $script:chunkIndex = 0
-
-    }
-
-    $script:nextChunkTime = (Get-Date).AddSeconds($script:chunkInterval)
 
 }
 
@@ -1527,9 +2477,11 @@ $script:hyUpdateJobScript = {
 
     param($secids)
 
-    # 并发抓取半年涨跌：每�?secid ��?runspace，最�?8 丹�发�?
+    $secids = @($secids | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 
-    # 使用 here-string �?worker 逻辑完整传给每个 runspace，避免作用域��?
+    # 并发抓取半年涨跌：每个 secid 一个 runspace，最多 8 并发
+
+    # 使用 here-string 将 worker 逻辑完整传给每个 runspace，避免作用域问题
 
     $workerSource = @'
 
@@ -1551,7 +2503,7 @@ function Fetch-Json($url, $timeout = 15, $retries = 1) {
 
         try {
 
-            return Invoke-RestMethod -Uri $url -TimeoutSec $timeout -UseBasicParsing -Headers $headers
+            return Invoke-RestMethod -Uri $url -TimeoutSec $timeout -UseBasicParsing -Headers $headers -DisableKeepAlive
 
         } catch {
 
@@ -1689,7 +2641,7 @@ function Start-HalfYearUpdate($rows) {
 
     if (-not $fetchHy) { return }
 
-    # 若已有后台任务在运�，则不重复启劼�避免世�尚未完成的抓�?
+    # 若已有后台任务在运行，则不重复启动，避免覆盖尚未完成的抓取
 
     if ($script:hyUpdateJob -ne $null -and $script:hyUpdateJob.State -eq 'Running') { return }
 
@@ -1751,6 +2703,228 @@ function Complete-HalfYearUpdate {
 
 }
 
+# ---------- 缓存：PE / PB ----------
+
+$script:pepbCachePath = Join-Path $PSScriptRoot '.pepb_cache.json'
+
+$script:pepbCache = @{}   # secid -> @{ date; pe; pb }
+
+$script:pepbUpdateJob = $null
+
+function Load-PepbCache {
+
+    if (Test-Path $script:pepbCachePath) {
+
+        try {
+
+            $json = Get-Content $script:pepbCachePath -Encoding UTF8 | ConvertFrom-Json
+
+            foreach ($p in $json.PSObject.Properties) {
+
+                $script:pepbCache[$p.Name] = $p.Value
+
+            }
+
+        } catch {
+
+            # 缓存损坏时忽略，重新计算
+
+        }
+
+    }
+
+}
+
+function Save-PepbCache {
+
+    try {
+
+        Write-JsonFile $script:pepbCachePath $script:pepbCache
+
+    } catch {
+
+        # 保存失败不影响主流程
+
+    }
+
+}
+
+function Fetch-PepbData($secid) {
+
+    # 通过东财 ulist 接口取单只股票 PE/PB（f9=市盈率，f23=市净率）
+
+    try {
+
+        $url = "https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f9,f23&secids=$secid"
+
+        $data = Fetch-Json $url 15
+
+        $row = $data.data.diff | Select-Object -First 1
+
+        if ($row -ne $null -and $row.f9 -ne $null -and $row.f23 -ne $null) {
+
+            return @{
+
+                pe = [math]::Round([double]$row.f9, 2)
+
+                pb = [math]::Round([double]$row.f23, 2)
+
+            }
+
+        }
+
+    } catch {
+
+        Write-Host "[warn] PE/PB fetch failed for $secid : $_" -ForegroundColor DarkGray
+
+    }
+
+    return $null
+
+}
+
+function Get-Pepb($secid) {
+
+    # 只读当天缓存，不触发网络；缺失时触发后台补齐并返回 $null（对应区块暂不显示）
+
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+
+    $cached = $script:pepbCache[$secid]
+
+    if ($cached -ne $null -and $cached.date -eq $today) {
+
+        return @{ pe = $cached.pe; pb = $cached.pb }
+
+    }
+
+    Start-PepbUpdate @($secid)
+
+    return $null
+
+}
+
+$script:pepbUpdateJobScript = {
+
+    param($secids)
+
+    $secids = @($secids | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+
+    # 后台错时抓取 PE/PB，每只股票间隔 300ms，避免并发请求被限制
+
+    $headers = @{
+
+        'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+
+        'Referer'    = 'https://quote.eastmoney.com/'
+
+    }
+
+    $result = @{}
+
+    foreach ($secid in $secids) {
+
+        try {
+
+            $url = "https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f9,f23&secids=$secid"
+
+            $data = Invoke-RestMethod -Uri $url -TimeoutSec 15 -UseBasicParsing -Headers $headers -DisableKeepAlive
+
+            $row = $data.data.diff | Select-Object -First 1
+
+            if ($row -ne $null -and $row.f9 -ne $null -and $row.f23 -ne $null) {
+
+                $result[$secid] = @{
+
+                    pe = [math]::Round([double]$row.f9, 2)
+
+                    pb = [math]::Round([double]$row.f23, 2)
+
+                }
+
+            }
+
+        } catch {}
+
+        Start-Sleep -Milliseconds 300
+
+    }
+
+    return $result
+
+}
+
+function Start-PepbUpdate($secids) {
+
+    # 仅当天缓存不存在时启动后台错时更新
+
+    if ($script:pepbUpdateJob -ne $null -and $script:pepbUpdateJob.State -eq 'Running') { return }
+
+    if ($secids.Count -eq 0) { return }
+
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+
+    $toUpdate = @()
+
+    foreach ($secid in $secids) {
+
+        $cached = $script:pepbCache[$secid]
+
+        if ($cached -eq $null -or $cached.date -ne $today) {
+
+            $toUpdate += $secid
+
+        }
+
+    }
+
+    if ($toUpdate.Count -eq 0) { return }
+
+    $script:pepbUpdateJob = Start-Job -ScriptBlock $script:pepbUpdateJobScript -ArgumentList (,$toUpdate)
+
+}
+
+function Complete-PepbUpdate {
+
+    if ($script:pepbUpdateJob -eq $null) { return $false }
+
+    if ($script:pepbUpdateJob.State -in @('Completed', 'Failed')) {
+
+        $updated = $false
+
+        if ($script:pepbUpdateJob.State -eq 'Completed') {
+
+            $result = Receive-Job $script:pepbUpdateJob
+
+            $today = (Get-Date).ToString('yyyy-MM-dd')
+
+            if ($result -ne $null) {
+
+                foreach ($secid in $result.Keys) {
+
+                    $script:pepbCache[$secid] = @{ date = $today; pe = $result[$secid].pe; pb = $result[$secid].pb }
+
+                }
+
+                Save-PepbCache
+
+                $updated = $true
+
+            }
+
+        }
+
+        Remove-Job $script:pepbUpdateJob -Force -ErrorAction SilentlyContinue
+
+        $script:pepbUpdateJob = $null
+
+        return $updated
+
+    }
+
+    return $false
+
+}
+
 # ---------- 显示 ----------
 
 function Get-OpenPriceWithArrow($openVal, $prevCloseVal, $digits = 2) {
@@ -1775,13 +2949,13 @@ function Get-OpenPriceWithArrow($openVal, $prevCloseVal, $digits = 2) {
 
 }
 
-function Print-StockRowAt($r, $j, $stealth, $hasCursor) {
+function Print-StockRowAt($r, $j, $stealth, $hasCursor, [ref]$frameLines) {
 
-    # 在当前光标位罉�印单行股祼�调用前需先用 SetCursorPosition 定位�?
+    # 在当前光标位置打印单行股票，调用前需先用 SetCursorPosition 定位
 
     if ($stealth) {
 
-        $cursor = if ($hasCursor) { '>' } else { ' ' }
+        $cursor = if (Test-QuoteStale $r) { '!' } elseif ($hasCursor) { '>' } else { ' ' }
 
         $digits = if (Test-IsETF $r) { 3 } else { 2 }
 
@@ -1793,17 +2967,27 @@ function Print-StockRowAt($r, $j, $stealth, $hasCursor) {
 
         $turnover = Format-Number $r.f8
 
+        $turnoverStr = if ($turnover -eq '-') { '-' } else { "$turnover%" }
+
         $vr = Format-Number $r.f10
 
-        $line = $cursor + (Pad-Left $r.f12 7) + ' ' + (Pad-Right (Truncate-Name $r.f14) 8) + ' ' + (Pad-Left "$pct%" 9) + ' ' + (Pad-Left $change 9) + ' ' + (Pad-Left $price 8) + ' ' + (Pad-Left $vr 8) + ' ' + (Pad-Left $turnover 8)
+        $line = $cursor + (Pad-Left $r.f12 7) + ' ' + (Pad-Right (Truncate-Name $r.f14) 8) + ' ' + (Pad-Left "$pct%" 9) + ' ' + (Pad-Left $change 9) + ' ' + (Pad-Left $price 8) + ' ' + (Pad-Left $vr 8) + ' ' + (Pad-Left $turnoverStr 8)
 
-        Write-Host $line -ForegroundColor Gray
+        if ($frameLines -ne $null) {
+
+            $frameLines.Value += $line
+
+        } else {
+
+            Write-Host $line -ForegroundColor Gray
+
+        }
 
     } else {
 
         $bg = if ($j % 2 -eq 0) { 'Black' } else { 'DarkGray' }
 
-        $cursor = if ($hasCursor) { '>' } else { ' ' }
+        $cursor = if (Test-QuoteStale $r) { '!' } elseif ($hasCursor) { '>' } else { ' ' }
 
         $digits = if (Test-IsETF $r) { 3 } else { 2 }
 
@@ -1835,25 +3019,29 @@ function Print-StockRowAt($r, $j, $stealth, $hasCursor) {
 
         $prefix = $cursor + (Pad-Left $code 7) + ' ' + (Pad-Right $name 8) + ' '
 
-        $pctStr = Pad-Left "$pct%" 9
+        $pctStr = Pad-Left "$pct%" 8
 
-        $suffix = ' ' + (Pad-Left $change 9) + ' ' + (Pad-Left $price 8) + ' ' + (Pad-Left $prevClose 8) + ' ' + (Pad-Left $openPrice 8) + $openArrow + ' ' + (Pad-Left $high 8) + ' ' + (Pad-Left $low 8) + ' ' + (Pad-Left $vr 8) + ' ' + (Pad-Left $turnover 8) + ' ' + (Pad-Left $amount 9) + ' ' + (Pad-Left "$hyPct%" 10)
+        $suffix = ' ' + (Pad-Left $change 8) + ' ' + (Pad-Left $price 7) + ' ' + (Pad-Left $prevClose 7) + ' ' + (Pad-Left $openPrice 7) + $openArrow + ' ' + (Pad-Left $high 7) + ' ' + (Pad-Left $low 7) + ' ' + (Pad-Left $vr 7) + ' ' + (Pad-Left $turnover 8) + ' ' + (Pad-Left $amount 9) + ' ' + (Pad-Left "$hyPct%" 10)
 
-        Write-Host $prefix -ForegroundColor White -BackgroundColor $bg -NoNewline
+        $line = $prefix + $pctStr + $suffix
 
-        Write-Host $pctStr -ForegroundColor White -BackgroundColor $bg -NoNewline
+        if ($script:hasConsole) { $line = Truncate-ToWidth $line ([Console]::WindowWidth - 1) }
 
-        Write-Host $suffix -ForegroundColor White -BackgroundColor $bg
+        Write-Host $line -ForegroundColor White -BackgroundColor $bg
 
     }
 
 }
 
-function Print-StockRows($rows, $stealth, $cursorIndex = -1) {
+function Print-StockRows($rows, $stealth, $cursorIndex = -1, [ref]$frameLines) {
 
-    # 记录表头�在屏幕�号，用于后续仅重绘游标所在��?
+    # 记录表头所在屏幕行号，用于后续仅重绘游标所在行
 
-    if ($script:hasConsole) {
+    if ($frameLines -ne $null) {
+
+        $script:stockTableHeaderY = $frameLines.Value.Count
+
+    } elseif ($script:hasConsole) {
 
         try { $script:stockTableHeaderY = [Console]::CursorPosition.Y } catch {}
 
@@ -1865,17 +3053,41 @@ function Print-StockRows($rows, $stealth, $cursorIndex = -1) {
 
         $header = $headerPrefix + ' ' + (Pad-Left 'Chg%' 9) + ' ' + (Pad-Left 'Chg' 9) + ' ' + (Pad-Left 'Last' 8) + ' ' + (Pad-Left 'VolR' 8) + ' ' + (Pad-Left 'Turn%' 8)
 
-        Write-Host $header -ForegroundColor Gray
+        $sep = '-' * $STEALTH_TABLE_WIDTH
 
-        Write-Host ('-' * 64) -ForegroundColor DarkGray
+        if ($frameLines -ne $null) {
+
+            $frameLines.Value += $header
+
+            $frameLines.Value += $sep
+
+        } else {
+
+            Write-Host $header -ForegroundColor Gray
+
+            Write-Host $sep -ForegroundColor DarkGray
+
+        }
 
     } else {
 
-        $header = ' ' + (Pad-Left '代码' 7) + ' ' + (Pad-Right '名称' 8) + ' ' + (Pad-Left '涨跌幅' 9) + ' ' + (Pad-Left '涨跌额' 9) + ' ' + (Pad-Left '最新' 8) + ' ' + (Pad-Left '昨收' 8) + ' ' + (Pad-Left '今开' 9) + ' ' + (Pad-Left '最高' 8) + ' ' + (Pad-Left '最低' 8) + ' ' + (Pad-Left '量比' 8) + ' ' + (Pad-Left '换手%' 8) + ' ' + (Pad-Left '成交额' 9) + ' ' + (Pad-Left '半年涨跌' 10)
+        $header = ' ' + (Pad-Left '代码' 7) + ' ' + (Pad-Right '名称' 8) + ' ' + (Pad-Left '涨跌幅' 8) + ' ' + (Pad-Left '涨跌额' 8) + ' ' + (Pad-Left '最新' 7) + ' ' + (Pad-Left '昨收' 7) + ' ' + (Pad-Left '今开' 8) + ' ' + (Pad-Left '最高' 7) + ' ' + (Pad-Left '最低' 7) + ' ' + (Pad-Left '量比' 7) + ' ' + (Pad-Left '换手%' 8) + ' ' + (Pad-Left '成交额' 9) + ' ' + (Pad-Left '半年涨跌' 10)
 
-        Write-Host $header
+        if ($script:hasConsole) {
 
-        Write-Host ('-' * 122)
+            $width = [Console]::WindowWidth - 1
+
+            Write-Host (Truncate-ToWidth $header $width)
+
+            Write-Host ('-' * [math]::Min($NORMAL_TABLE_WIDTH, $width))
+
+        } else {
+
+            Write-Host $header
+
+            Write-Host ('-' * $NORMAL_TABLE_WIDTH)
+
+        }
 
     }
 
@@ -1883,7 +3095,7 @@ function Print-StockRows($rows, $stealth, $cursorIndex = -1) {
 
     foreach ($r in $rows) {
 
-        Print-StockRowAt $r $j $stealth ($j -eq $cursorIndex)
+        Print-StockRowAt $r $j $stealth ($j -eq $cursorIndex) $frameLines
 
         $j++
 
@@ -1893,9 +3105,9 @@ function Print-StockRows($rows, $stealth, $cursorIndex = -1) {
 
 function Update-Cursor($oldIndex, $newIndex, $rows, $stealth) {
 
-    # 仅更新�首的游标字�，避免重绘整行带来的闃�与延迟�?
+    # 仅更新行首的光标字符，避免重绘整行带来的闪烁与延迟
 
-    # 使用 [Console]::Write 直接输出，确保立即刷新到屏幕�?
+    # 使用 [Console]::Write 直接输出，确保立即刷新到屏幕
 
     if ($script:stockTableHeaderY -eq $null -or -not $rows -or $rows.Count -eq 0) { return }
 
@@ -1923,11 +3135,15 @@ function Update-Cursor($oldIndex, $newIndex, $rows, $stealth) {
 
                 [Console]::BackgroundColor = if ($idx % 2 -eq 0) { [ConsoleColor]::Black } else { [ConsoleColor]::DarkGray }
 
+            } else {
+
+                [Console]::BackgroundColor = [ConsoleColor]::Black
+
             }
 
             [Console]::ForegroundColor = $fg
 
-            $ch = if ($idx -eq $newIndex) { '>' } else { ' ' }
+            $ch = if (Test-QuoteStale $rows[$idx]) { '!' } elseif ($idx -eq $newIndex) { '>' } else { ' ' }
 
             [Console]::Write($ch)
 
@@ -1943,13 +3159,23 @@ function Update-Cursor($oldIndex, $newIndex, $rows, $stealth) {
 
 }
 
-function Print-IndexRows($rows, $stealth) {
+function Print-IndexRows($rows, $stealth, [ref]$frameLines) {
 
     if ($rows.Count -eq 0) { return }
 
-    $tableWidth = if ($stealth) { 64 } else { 122 }
+    $tableWidth = if ($stealth) { $STEALTH_TABLE_WIDTH } else { $NORMAL_TABLE_WIDTH }
 
-    Write-Host ('-' * $tableWidth) -ForegroundColor DarkGray
+    $sep = '-' * $tableWidth
+
+    if ($frameLines -ne $null) {
+
+        $frameLines.Value += $sep
+
+    } else {
+
+        Write-Host $sep -ForegroundColor DarkGray
+
+    }
 
     if ($stealth) {
 
@@ -1967,7 +3193,15 @@ function Print-IndexRows($rows, $stealth) {
 
             $line = (Pad-Right $name 8) + ' ' + (Pad-Left $price 10) + ' ' + (Pad-Left "$change / $pct%" 20)
 
-            Write-Host $line -ForegroundColor Gray
+            if ($frameLines -ne $null) {
+
+                $frameLines.Value += $line
+
+            } else {
+
+                Write-Host $line -ForegroundColor Gray
+
+            }
 
             $j++
 
@@ -2059,9 +3293,11 @@ function Print-IndexRows($rows, $stealth) {
 
         }
 
-        Write-Host (Pad-Right $line1 $tableWidth)
+        $width = if ($script:hasConsole) { [math]::Min($tableWidth, [Console]::WindowWidth - 1) } else { $tableWidth }
 
-        Write-Host (Pad-Right $line2 $tableWidth)
+        Write-Host (Pad-Right $line1 $width)
+
+        Write-Host (Pad-Right $line2 $width)
 
     }
 
@@ -2087,21 +3323,14 @@ function Get-SortedRows($rows, $sortState) {
 
     }
 
-    $rows | Sort-Object {
-
-        $v = $_.$field
-
-        try {
-
-            [double]$v
-
-        } catch {
-
-            if ($desc) { [double]::MinValue } else { [double]::MaxValue }
-
-        }
-
-    } -Descending:$desc
+    $rows | Sort-Object -Property @(
+        @{ Expression = {
+            try { [void][double]$_.$field; 0 } catch { 1 }
+        } },
+        @{ Expression = {
+            try { [double]$_.$field } catch { 0.0 }
+        }; Descending = $desc }
+    )
 
 }
 
@@ -2121,13 +3350,13 @@ function Get-SortHint($sortState) {
 
 }
 
-function Print-MarketTotal($info, $stealth) {
+function Print-MarketTotal($info, $stealth, [ref]$frameLines) {
 
-    # 在指数方块下方打印沪深京三市场成交��与量比�?
+    # 在指数方块下方打印沪深京三市场成交额与量比
 
     if ($info -eq $null -or $info.total_yi -eq $null -or $info.ratio -eq $null) { return }
 
-    $tableWidth = if ($stealth) { 64 } else { 122 }
+    $tableWidth = if ($stealth) { $STEALTH_TABLE_WIDTH } else { $NORMAL_TABLE_WIDTH }
 
     $label = "三市总额/量比 "
 
@@ -2137,11 +3366,11 @@ function Print-MarketTotal($info, $stealth) {
 
     if ($stealth) {
 
-        # 让数值斜杠与 stealth 指数�?"change / pct%" 的斜杠��?
+        # 让数值斜杠与 stealth 指数行 "change / pct%" 的斜杠对齐
 
-        # 指数行斜杠位于显示列 33�?-based），�倒推前�空格
+        # 指数行斜杠位于显示列 33（0-based），倒推前面空格
 
-        $targetSlashPos = 32  # 斜杠前所有字符的显示宽度�?-based�?
+        $targetSlashPos = 32  # 斜杠前所有字符的显示宽度（0-based）
 
         $spacesNeeded = $targetSlashPos - (Measure-DisplayWidth $label) - (Measure-DisplayWidth $amountStr)
 
@@ -2155,49 +3384,446 @@ function Print-MarketTotal($info, $stealth) {
 
     }
 
-    Write-Host (Pad-Right $line $tableWidth)
+    $paddedLine = Pad-Right $line $tableWidth
 
-}
+    if ($frameLines -ne $null) {
 
-function Print-Quotes($stockRows, $indexRows, $showIndex, $stealth, $cursorIndex = -1) {
-
-    $now = Get-Date -Format "HH:mm:ss"
-
-    if ($stealth) {
-
-        Write-Host "System Monitor  |  Last update: $now (Refresh: ${interval}s)" -ForegroundColor Gray
+        $frameLines.Value += $paddedLine
 
     } else {
 
-        Write-Host "自选股行情 ($($stockRows.Count) 只)    刷新时间: $now (${interval} 秒自动刷新)"
+        Write-Host $paddedLine
 
     }
 
-    if ($stockRows.Count -gt 0) {
+}
 
-        Print-StockRows $stockRows $stealth $cursorIndex
+# ---------- 屏幕写入 ----------
+#
+# 重要（实测结论）：
+# 中文是全角字符，终端按两列显示。实测三种写法的效果：
+#   1) WriteConsoleOutputW 按“单元格”写：汉字后面会多占一列 -> 整行右移、与表头错位；
+#   2) WriteConsoleOutputCharacterW 按“字符”写：汉字会被重复画一次 -> 名称变成“瑞瑞联联…”；
+#   3) PowerShell 自带的 $host.UI.RawUI.SetBufferContents + NewBufferCellArray：渲染正确。
+# 因此这里保持用 3)，并且只重画内容发生变化的行，把刷新量降到最小，减少闪烁。
+#
+# 需要抓刷新时序时，设置环境变量 WATCH_FRAME_LOG=1 再启动，
+# 每次写屏会往 .frame_log.txt 追加一行（默认不写任何文件）。
 
-    }
+$script:frameLogPath = Join-Path $PSScriptRoot '.frame_log.txt'
 
-    $rowsToShow = @()
+function Write-FrameLog($text) {
+
+    if ($env:WATCH_FRAME_LOG -ne '1') { return }
+
+    try { Add-Content -LiteralPath $script:frameLogPath -Value ("{0} {1}" -f (Get-Date -Format 'HH:mm:ss.fff'), $text) -Encoding UTF8 } catch {}
+
+}
+
+function Write-WarnLine($text) {
+
+    # 提示信息会写到光标所在的屏幕位置，可能把隐蔽模式的表格顶动/滚屏，
+    # 所以隐蔽模式下不打印，只在开启 WATCH_FRAME_LOG=1 时记入日志；
+    # 详情模式（中文红绿）仍然照常打印。
 
     if ($stealth) {
 
-        $rowsToShow = $indexRows | Where-Object { $_.f14 -eq '上证指数' -or $_.f14 -eq '深证成指' }
+        Write-FrameLog $text
 
-    } elseif ($showIndex) {
+    } else {
 
-        $rowsToShow = $indexRows
+        Write-Host $text -ForegroundColor DarkGray
 
     }
 
-    if ($rowsToShow.Count -gt 0) {
+}
 
-        Print-IndexRows $rowsToShow $stealth
+function Write-FrameLine($y, $line, $fgColor, $bgColor) {
 
-        $marketInfo = Get-MarketTotalAmounts $indexRows
+    # 单行写入（回退时也可用）
 
-        Print-MarketTotal $marketInfo $stealth
+    try {
+
+        $buffer = $host.UI.RawUI.NewBufferCellArray(@($line), $fgColor, $bgColor)
+
+        $host.UI.RawUI.SetBufferContents(@{X = 0; Y = $y}, $buffer)
+
+        return $true
+
+    } catch {
+
+        return $false
+
+    }
+
+}
+
+function Write-Frame($lines, $fgColor = 'Gray', $bgColor = 'Black') {
+
+    if (-not $script:hasConsole) {
+
+        foreach ($line in $lines) {
+
+            Write-Host $line -ForegroundColor $fgColor
+
+        }
+
+        return
+
+    }
+
+    $windowWidth = [Console]::WindowWidth
+
+    $windowHeight = [Console]::WindowHeight
+
+    # 先把所有行按窗口宽度补齐/截断，保证差异比较基于实际显示内容
+
+    $paddedLines = @()
+
+    foreach ($line in $lines) {
+
+        $pad = $windowWidth - (Measure-DisplayWidth $line)
+
+        if ($pad -gt 0) {
+
+            $line += ' ' * $pad
+
+        } elseif ($pad -lt 0) {
+
+            $line = Truncate-ToWidth $line $windowWidth
+
+        }
+
+        $paddedLines += $line
+
+    }
+
+    # 缓冲区至少要装得下整帧再多留一行给光标，避免写入把窗口顶上去
+
+    try {
+
+        $bufSize = $host.UI.RawUI.BufferSize
+
+        $newWidth = $bufSize.Width
+
+        $newHeight = $bufSize.Height
+
+        $needResize = $false
+
+        if ($bufSize.Width -lt $windowWidth) { $newWidth = $windowWidth; $needResize = $true }
+
+        if ($bufSize.Height -lt ($paddedLines.Count + 1)) { $newHeight = $paddedLines.Count + 1; $needResize = $true }
+
+        if ($needResize) {
+
+            try { $host.UI.RawUI.BufferSize = @{Width = $newWidth; Height = $newHeight} } catch {}
+
+        }
+
+    } catch {}
+
+    # 窗口被滚动过（例如提示信息把内容顶上去）时整屏重画并回到顶部
+
+    $force = $false
+
+    try { if ([Console]::WindowTop -ne 0) { $force = $true } } catch {}
+
+    $lastLines = $script:lastFrameLines
+
+    $blankLine = ' ' * $windowWidth
+
+    if ($force -or ($lastLines -eq $null) -or ($lastLines.Count -ne $paddedLines.Count)) {
+
+        if ($force) {
+
+            try { $host.UI.RawUI.WindowPosition = @{X = 0; Y = 0} } catch {}
+
+        }
+
+        for ($i = 0; $i -lt $paddedLines.Count; $i++) {
+
+            if (-not (Write-FrameLine $i $paddedLines[$i] $fgColor $bgColor)) { break }
+
+        }
+
+        $fill = [math]::Max(0, $windowHeight - $paddedLines.Count)
+
+        for ($i = 0; $i -lt $fill; $i++) {
+
+            [void](Write-FrameLine ($paddedLines.Count + $i) $blankLine $fgColor $bgColor)
+
+        }
+
+        Write-FrameLog ("full rows=$($paddedLines.Count) fill=$fill windowTop=$([Console]::WindowTop)")
+
+    } else {
+
+        $changed = @()
+
+        for ($i = 0; $i -lt $paddedLines.Count; $i++) {
+
+            if ($paddedLines[$i] -ne $lastLines[$i]) { $changed += $i }
+
+        }
+
+        foreach ($i in $changed) {
+
+            [void](Write-FrameLine $i $paddedLines[$i] $fgColor $bgColor)
+
+        }
+
+        if ($changed.Count -gt 0) { Write-FrameLog ("diff rows=[$($changed -join ',')]") }
+
+    }
+
+    $script:lastFrameLines = $paddedLines
+
+    # 光标停到表格下方；整帧比窗口高时停在窗口最后一行，避免把表头顶出视野
+
+    try {
+
+        $parkY = [math]::Min($paddedLines.Count, $windowHeight - 1)
+
+        if ($parkY -lt 0) { $parkY = 0 }
+
+        [Console]::SetCursorPosition(0, $parkY)
+
+    } catch {}
+
+}
+
+# 注意：此函数目前没有任何调用点（保留备用）。
+# 它内部仍是旧的 ConsoleOutputHelper 写法（[short] / [ushort] 在 Windows PowerShell 5.1 里
+# 无法解析，CHAR_INFO 也缺少 CharSet.Unicode），直接启用会静默失败；
+# 将来若要使用，请改用上面的 Write-Frame（同样的按屏幕列构造单元格、整行写入的逻辑）。
+
+function Update-FieldChanges($fieldInfos) {
+
+    if ($fieldInfos -eq $null -or $fieldInfos.Count -eq 0) { return 0 }
+
+    # 初始化底层控制台输出 API
+
+    if ($script:consoleOutputHelperInitialized -eq $null) {
+
+        $script:consoleOutputHelperInitialized = $true
+
+        try {
+
+            Add-Type -TypeDefinition @"
+
+using System;
+
+using System.Runtime.InteropServices;
+
+public class ConsoleOutputHelper {
+
+    public const int STD_OUTPUT_HANDLE = -11;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+
+    public static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+
+    public static extern bool WriteConsoleOutput(IntPtr hConsoleOutput, CHAR_INFO[] lpBuffer, COORD dwBufferSize, COORD dwBufferCoord, ref SMALL_RECT lpWriteRegion);
+
+    [StructLayout(LayoutKind.Explicit)]
+
+    public struct CHAR_INFO {
+
+        [FieldOffset(0)] public char UnicodeChar;
+
+        [FieldOffset(2)] public ushort Attributes;
+
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+
+    public struct COORD {
+
+        public short X;
+
+        public short Y;
+
+        public COORD(short x, short y) { X = x; Y = y; }
+
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+
+    public struct SMALL_RECT {
+
+        public short Left;
+
+        public short Top;
+
+        public short Right;
+
+        public short Bottom;
+
+        public SMALL_RECT(short l, short t, short r, short b) { Left = l; Top = t; Right = r; Bottom = b; }
+
+    }
+
+}
+
+"@ -ErrorAction Stop
+
+            $script:consoleOutputHelperLoaded = $true
+
+        } catch {
+
+            $script:consoleOutputHelperLoaded = $false
+
+        }
+
+    }
+
+    if (-not $script:consoleOutputHelperLoaded) { return 0 }
+
+    if ($script:lastFieldState -eq $null) { $script:lastFieldState = @{} }
+
+    function _fieldColorAttr($colorName) {
+
+        try { return [int][Enum]::Parse([System.ConsoleColor], $colorName) } catch { return 7 }
+
+    }
+
+    $hOut = [ConsoleOutputHelper]::GetStdHandle([ConsoleOutputHelper]::STD_OUTPUT_HANDLE)
+
+    # 清理已经不在当前帧中的旧字段（例如排序后行号改变）
+
+    $currentKeys = New-Object System.Collections.Generic.HashSet[string]
+
+    foreach ($field in $fieldInfos) { [void]$currentKeys.Add("$($field.Row):$($field.Name)") }
+
+    $oldKeys = @($script:lastFieldState.Keys) | Where-Object { -not $currentKeys.Contains($_) }
+
+    foreach ($key in $oldKeys) { $script:lastFieldState.Remove($key) }
+
+    $updatedCount = 0
+
+    foreach ($field in $fieldInfos) {
+
+        $key = "$($field.Row):$($field.Name)"
+
+        $last = $script:lastFieldState[$key]
+
+        if ($last -eq $null -or $last.Text -ne $field.Text -or $last.Fg -ne $field.Fg) {
+
+            $fg = _fieldColorAttr $field.Fg
+
+            $bg = _fieldColorAttr 'Black'
+
+            $attr = [ushort]($fg + ($bg -shl 4))
+
+            $text = Pad-Right $field.Text $field.Width
+
+            $chars = $text.ToCharArray()
+
+            $buf = New-Object ConsoleOutputHelper+CHAR_INFO[] $chars.Length
+
+            for ($i = 0; $i -lt $chars.Length; $i++) {
+
+                $buf[$i].UnicodeChar = $chars[$i]
+
+                $buf[$i].Attributes = $attr
+
+            }
+
+            $bufSize = New-Object ConsoleOutputHelper+COORD($chars.Length, 1)
+
+            $bufCoord = New-Object ConsoleOutputHelper+COORD(0, 0)
+
+            $right = $field.X + $field.Width - 1
+
+            $rect = New-Object ConsoleOutputHelper+SMALL_RECT([short]$field.X, [short]$field.Row, [short]$right, [short]$field.Row)
+
+            [void][ConsoleOutputHelper]::WriteConsoleOutput($hOut, $buf, $bufSize, $bufCoord, [ref]$rect)
+
+            $script:lastFieldState[$key] = $field
+
+            $updatedCount++
+
+        }
+
+    }
+
+    return $updatedCount
+
+}
+
+function Print-Quotes($stockRows, $indexRows, $showIndex, $stealth, $cursorIndex = -1, $buttonBarText = $null) {
+
+    $now = if ($script:lastQuoteSuccess -ne $null) { $script:lastQuoteSuccess.ToString('HH:mm:ss') } else { '--:--:--' }
+
+    $state = if ($script:quoteStatus) { ' | ' + $script:quoteStatus } else { '' }
+
+    if ($stealth) {
+
+        $frameLines = @()
+
+        $frameLines += "System Monitor  |  Data: $now (Refresh: ${interval}s)$state"
+
+        if ($stockRows.Count -gt 0) {
+
+            Print-StockRows $stockRows $stealth $cursorIndex ([ref]$frameLines)
+
+        }
+
+        $rowsToShow = @()
+
+        $rowsToShow = $indexRows | Where-Object { $_.f14 -eq '上证指数' -or $_.f14 -eq '深证成指' }
+
+        if ($rowsToShow.Count -gt 0) {
+
+            Print-IndexRows $rowsToShow $stealth ([ref]$frameLines)
+
+            $marketInfo = Get-MarketTotalAmounts $indexRows
+
+            Print-MarketTotal $marketInfo $stealth ([ref]$frameLines)
+
+        }
+
+        # 把按钮栏也纳入统一缓冲区，避免单独 Write-Host 重绘时闪烁
+
+        if (-not [string]::IsNullOrEmpty($buttonBarText)) {
+
+            $frameLines += ""
+
+            $frameLines += $buttonBarText
+
+        }
+
+        Write-Frame $frameLines 'Gray'
+
+    } else {
+
+        Write-Host "自选股行情 ($($stockRows.Count) 只)    行情时间: $now (${interval} 秒自动刷新)$state"
+
+        if ($stockRows.Count -gt 0) {
+
+            Print-StockRows $stockRows $stealth $cursorIndex
+
+        }
+
+        $rowsToShow = @()
+
+        if ($showIndex) {
+
+            $rowsToShow = $indexRows
+
+        }
+
+        if ($rowsToShow.Count -gt 0) {
+
+            Print-IndexRows $rowsToShow $stealth
+
+            $marketInfo = Get-MarketTotalAmounts $indexRows
+
+            Print-MarketTotal $marketInfo $stealth
+
+        }
 
     }
 
@@ -2215,7 +3841,7 @@ function Enter-DepthMode($row, $stockRows, $startIndex) {
 
     $script:depthStockIndex = $startIndex
 
-    $script:depthNextRefreshTime = (Get-Date).AddSeconds(5)
+    $script:depthNextRefreshTime = (Get-Date).AddSeconds(10)
 
     $script:lastDepthVolume = $null
 
@@ -2223,7 +3849,9 @@ function Enter-DepthMode($row, $stockRows, $startIndex) {
 
     $script:depthViewLast = $null
 
-    Clear-Host
+    $script:lastFrameLines = $null
+
+    if (-not $stealth) { Clear-Host }
 
 }
 
@@ -2232,6 +3860,8 @@ function Exit-DepthMode {
     $script:depthMode = $false
 
     $script:depthSecid = $null
+
+    $script:depthPending = $null
 
     $script:depthRow = $null
 
@@ -2247,29 +3877,98 @@ function Exit-DepthMode {
 
     $script:depthViewLast = $null
 
-    Clear-Host
+    $script:lastFrameLines = $null
+
+    if (-not $stealth) { Clear-Host }
 
 }
+
+function Get-SealAmount($depth, $row) {
+
+    # 若最新价触及涨停/跌停，计算并返回封板金额（元）。
+
+    if ($depth.price -eq $null) { return $null, $null }
+
+    $price = [double]$depth.price
+
+    $name = "$($depth.name)"
+
+    $code = "$($depth.code)"
+
+    $isETF = $name -and $name.ToUpper().Contains('ETF')
+
+    if ($isETF) { return $null, $null }
+
+    if ($depth.prev_close -eq $null -or $depth.prev_close -eq 0) { return $null, $null }
+
+    $prevClose = [double]$depth.prev_close
+
+    $limitRatio = 0.10
+
+    if ($name -match 'ST') { $limitRatio = 0.05 }
+
+    elseif ($code -match '^688') { $limitRatio = 0.20 }
+
+    elseif ($code -match '^(300|301)') { $limitRatio = 0.20 }
+
+    elseif ($code -match '^(8|4)') { $limitRatio = 0.30 }
+
+    $digits = 2
+
+    $eps = [math]::Pow(10, -$digits - 1)
+
+    $limitUp = [math]::Round($prevClose * (1 + $limitRatio), $digits)
+
+    $limitDown = [math]::Round($prevClose * (1 - $limitRatio), $digits)
+
+    $bids = $depth.bids
+
+    $asks = $depth.asks
+
+    if ([math]::Abs($price - $limitUp) -lt $eps) {
+
+        if ($bids -and $bids.Count -gt 0 -and $bids[0][0] -ne $null -and $bids[0][1] -ne $null) {
+
+            $sealPrice = [double]$bids[0][0]
+
+            $sealVol = [int]$bids[0][1]
+
+            return '封板', ($sealPrice * $sealVol * 100)
+
+        }
+
+    }
+
+    if ([math]::Abs($price - $limitDown) -lt $eps) {
+
+        if ($asks -and $asks.Count -gt 0 -and $asks[0][0] -ne $null -and $asks[0][1] -ne $null) {
+
+            $sealPrice = [double]$asks[0][0]
+
+            $sealVol = [int]$asks[0][1]
+
+            return '封板', ($sealPrice * $sealVol * 100)
+
+        }
+
+    }
+
+    return $null, $null
+
+}
+
 
 function Show-DepthView($row, $stealth) {
 
     $secid = "$($row.f13).$($row.f12)"
 
-    $d = Fetch-DepthData $secid $row.f14
+    # 优先用缓存（当天磁盘/内存）或骨架立即渲染；网络获取放后台 job，数据回来后增量刷新
 
-    if ($d -eq $null) {
+    $d = $script:depthCache[$secid]
 
-        if (-not $script:depthViewDrawn) {
+    if ($d -eq $null) { $d = Get-DepthSkeleton $row }
 
-            Clear-Host
-
-            Write-Host "[错误] 无法获取盘口数据" -ForegroundColor Red
-
-        }
-
-        return $false
-
-    }
+    Start-DepthUpdate $secid $row.f14
 
     $name = $d.name
 
@@ -2287,13 +3986,13 @@ function Show-DepthView($row, $stealth) {
 
     $greenFg = if ($stealth) { 'Gray' } else { 'Green' }
 
-    $mainSep = '-' * 53
+    $mainSep = '-' * 57
 
     $rightSep = '-' * 28
 
     $lines = @()
 
-    # 标题行：名称 代码 最新价▲▼ 涨跌额 涨跌幅
+    # 标题行：代码 名称 当前价格▲▼ 涨跌额 涨跌幅 现手
 
     if ($hasQuote) {
 
@@ -2311,17 +4010,21 @@ function Show-DepthView($row, $stealth) {
 
         $pricePart = $price + ' ' + $arrow
 
-        $pricePartPadded = $pricePart + (' ' * (12 - (Measure-DisplayWidth $pricePart)))
+        $priceCol = Pad-Left $pricePart 10
 
-        $changePadded = $change + (' ' * (9 - (Measure-DisplayWidth $change)))
+        $changeCol = Pad-Left $change 9
 
-        $header = (Pad-Right $name 8) + '    ' + (Pad-Right $code 6) + '        ' + $pricePartPadded + $changePadded + $pct + '%'
+        $pctCol = Pad-Left ($pct + '%') 7
+
+        $volCol = Pad-Left (Format-LatestVol $row.f30) 11
+
+        $header = (Pad-Right $code 6) + ' ' + (Pad-Right $name 8) + ' ' + $priceCol + ' ' + $changeCol + ' ' + $pctCol + ' ' + $volCol
 
     } else {
 
         $headerFg = if ($stealth) { 'Gray' } else { 'DarkGray' }
 
-        $header = (Pad-Right $name 8) + '    ' + (Pad-Right $code 6) + '        未开盘'
+        $header = (Pad-Right $code 6) + ' ' + (Pad-Right $name 8) + '          未开盘'
 
     }
 
@@ -2359,20 +4062,50 @@ function Show-DepthView($row, $stealth) {
 
         # 左侧信息
 
-        $leftLabels = @('最新', '现手', '昨收', '今开', '最高', '最低', '涨停', '跌停', '换手', '成交', '量比')
+        $leftLabels = @('均价', '昨收', '今开', '最高', '最低', '涨停', '跌停', '换手', '成交', '量比')
+
+        $highPct = if ($d.high -ne $null -and $d.prev_close -ne $null -and $d.prev_close -ne 0) {
+
+            $pct = [math]::Round(($d.high - $d.prev_close) / $d.prev_close * 100, 2)
+
+            $sign = if ($pct -gt 0) { '+' } else { '' }
+
+            "$sign$pct%"
+
+        } else { '-' }
+
+        $lowPct = if ($d.low -ne $null -and $d.prev_close -ne $null -and $d.prev_close -ne 0) {
+
+            $pct = [math]::Round(($d.low - $d.prev_close) / $d.prev_close * 100, 2)
+
+            $sign = if ($pct -gt 0) { '+' } else { '' }
+
+            "$sign$pct%"
+
+        } else { '-' }
 
         $leftValues = @(
-            (Format-Number $d.price $digits),
-            (Format-LatestVol $row.f30),
+
+            (Format-AvgPrice $row $d.amount $d.volume),
+
             (Format-Number $d.prev_close $digits),
+
             (Format-Number $d.open $digits),
-            (Format-Number $d.high $digits),
-            (Format-Number $d.low $digits),
+
+            (Format-PricePctPair (Format-Number $d.high $digits) $highPct),
+
+            (Format-PricePctPair (Format-Number $d.low $digits) $lowPct),
+
             (Format-Number $limitUp $digits),
+
             (Format-Number $limitDown $digits),
+
             ((Format-Number $row.f8) + '%'),
+
             ((Format-Yi $row.f6) + '亿'),
+
             (Format-Number $row.f10)
+
         )
 
         # 右侧盘口
@@ -2413,9 +4146,23 @@ function Show-DepthView($row, $stealth) {
 
         } else {
 
-            for ($i = 0; $i -lt $leftLabels.Count; $i++) {
+            $sealLabel, $sealAmount = Get-SealAmount $d $row
 
-                $left = (Pad-Right $leftLabels[$i] 6) + ' ' + (Pad-Left $leftValues[$i] 14)
+            for ($i = 0; $i -lt $rightLines.Count; $i++) {
+
+                if ($i -lt $leftLabels.Count) {
+
+                    $left = (Pad-Right $leftLabels[$i] 6) + ' ' + (Pad-Right $leftValues[$i] 16)
+
+                } elseif ($sealLabel -and $sealAmount -ne $null -and $i -eq $leftLabels.Count) {
+
+                    $left = (Pad-Right $sealLabel 6) + ' ' + (Pad-Right ((Format-Yi $sealAmount) + '亿') 16)
+
+                } else {
+
+                    $left = ' ' * 23
+
+                }
 
                 $lines += [PSCustomObject]@{ Text = ($left + '    ' + $rightLines[$i]); Color = $normalFg }
 
@@ -2425,15 +4172,87 @@ function Show-DepthView($row, $stealth) {
 
         $lines += [PSCustomObject]@{ Text = $mainSep; Color = 'DarkGray' }
 
-        # 市值 + 流通
+        # 日均线（当天首次计算后放缓存，后续直接复用）
 
-        $totalCap = Format-WanYi $row.f20
+        $mas = Get-DailyMAs $secid
 
-        $floatCap = Format-Yi $row.f21
+        if ($mas -ne $null) {
 
-        $capLine = (Pad-Right '市值' 6) + ' ' + (Pad-Left ($totalCap + '万亿') 14) + '        ' + (Pad-Right '流通' 6) + ' ' + (Pad-Left ($floatCap + '亿') 14)
+            $maLabels = @('均线', '10日', '20日', '30日', '120日', '250日')
 
-        $lines += [PSCustomObject]@{ Text = $capLine; Color = $normalFg }
+            $maVals = @((Format-Number $mas.ma10 $digits), (Format-Number $mas.ma20 $digits), (Format-Number $mas.ma30 $digits), (Format-Number $mas.ma120 $digits), (Format-Number $mas.ma250 $digits))
+
+            $colWidth = 0
+
+            for ($i = 0; $i -lt $maLabels.Count; $i++) {
+
+                $w = Measure-DisplayWidth $maLabels[$i]
+
+                if ($i -gt 0) {
+
+                    $w = [math]::Max($w, (Measure-DisplayWidth $maVals[$i - 1]))
+
+                }
+
+                if ($w -gt $colWidth) { $colWidth = $w }
+
+            }
+
+            $maCells = @('') + $maVals
+
+            # 列内右对齐价格，列间距在不超过 53 字符虚线的前提下尽量拉开
+
+            $maxSep = 4
+
+            $sep = $maxSep
+
+            while ($sep -gt 1 -and ($maLabels.Count * $colWidth + ($maLabels.Count - 1) * $sep) -gt 53) {
+
+                $sep--
+
+            }
+
+            $sepStr = ' ' * $sep
+
+            $maHeader = ($maLabels | ForEach-Object { Pad-Right $_ $colWidth }) -join $sepStr
+
+            $maValues = ($maCells | ForEach-Object { Pad-Left $_ $colWidth }) -join $sepStr
+
+            $lines += [PSCustomObject]@{ Text = $maHeader; Color = $normalFg }
+
+            $lines += [PSCustomObject]@{ Text = $maValues; Color = $normalFg }
+
+            $lines += [PSCustomObject]@{ Text = $mainSep; Color = 'DarkGray' }
+
+        }
+
+        # PE / PB / 市值 / 流通（当天首次计算后放缓存，后续直接复用）
+
+        $pepb = Get-Pepb $secid
+
+        $totalCap, $totalCapUnit = Format-Cap $row.f20
+
+        $floatCap, $floatCapUnit = Format-Cap $row.f21
+
+        if ($pepb -ne $null) {
+
+            $peDisplay = if ($pepb.pe -lt 0) { '-' } else { Format-Number $pepb.pe 2 }
+
+            $pepbLine1 = (Pad-Right '市值' 6) + ' ' + (Pad-Left ($totalCap + $totalCapUnit) 14) + '        ' + (Pad-Right 'PE' 6) + ' ' + (Pad-Left $peDisplay 14)
+
+            $lines += [PSCustomObject]@{ Text = $pepbLine1; Color = $normalFg }
+
+            $pepbLine2 = (Pad-Right '流通' 6) + ' ' + (Pad-Left ($floatCap + $floatCapUnit) 14) + '        ' + (Pad-Right 'PB' 6) + ' ' + (Pad-Left (Format-Number $pepb.pb 2) 14)
+
+            $lines += [PSCustomObject]@{ Text = $pepbLine2; Color = $normalFg }
+
+        } else {
+
+            $capLine = (Pad-Right '市值' 6) + ' ' + (Pad-Left ($totalCap + $totalCapUnit) 14) + '        ' + (Pad-Right '流通' 6) + ' ' + (Pad-Left ($floatCap + $floatCapUnit) 14)
+
+            $lines += [PSCustomObject]@{ Text = $capLine; Color = $normalFg }
+
+        }
 
         $lines += [PSCustomObject]@{ Text = ''; Color = $normalFg }
 
@@ -2442,6 +4261,10 @@ function Show-DepthView($row, $stealth) {
         $lines += [PSCustomObject]@{ Text = '  暂无行情'; Color = 'DarkGray' }
 
     }
+
+    $depthTime = if ($d.fetched_at) { $d.fetched_at } else { '等待后台刷新' }
+
+    $lines += [PSCustomObject]@{ Text = "盘口数据时间: $depthTime"; Color = 'DarkGray' }
 
     # 增量渲染：首次全屏绘制，之后只重写变化的行
 
@@ -2455,9 +4278,9 @@ function Show-DepthView($row, $stealth) {
 
                 [Console]::SetCursorPosition(0, $i)
 
-                $text = $lines[$i].Text
+                $text = Truncate-ToWidth $lines[$i].Text ([Console]::WindowWidth - 1)
 
-                $pad = [Console]::WindowWidth - (Measure-DisplayWidth $text)
+                $pad = [Console]::WindowWidth - 1 - (Measure-DisplayWidth $text)
 
                 if ($pad -gt 0) { $text += ' ' * $pad }
 
@@ -2477,9 +4300,9 @@ function Show-DepthView($row, $stealth) {
 
                     [Console]::SetCursorPosition(0, $i)
 
-                    $text = $lines[$i].Text
+                    $text = Truncate-ToWidth $lines[$i].Text ([Console]::WindowWidth - 1)
 
-                    $pad = [Console]::WindowWidth - (Measure-DisplayWidth $text)
+                    $pad = [Console]::WindowWidth - 1 - (Measure-DisplayWidth $text)
 
                     if ($pad -gt 0) { $text += ' ' * $pad }
 
@@ -2547,19 +4370,21 @@ function Show-FakeScreen {
 
     Write-Host "> project@1.0.0 build D:\project" -ForegroundColor Gray
 
+    Write-Host ""
+
     Write-Host "> tsc && vite build" -ForegroundColor Gray
 
     Write-Host ""
 
     Write-Host "vite v5.0.0 building for production..." -ForegroundColor Gray
 
-    Write-Host "�?128 modules transformed." -ForegroundColor Gray
+    Write-Host "[12:34:56] 128 modules transformed." -ForegroundColor Gray
 
     Write-Host "dist/index.html                   0.45 kB" -ForegroundColor Gray
 
     Write-Host "dist/assets/index-a1b2c3d4.js   142.31 kB" -ForegroundColor Gray
 
-    Write-Host "�?built in 3.42s" -ForegroundColor Gray
+    Write-Host "[12:34:56] built in 3.42s" -ForegroundColor Gray
 
     Write-Host ""
 
@@ -2567,11 +4392,9 @@ function Show-FakeScreen {
 
 }
 
-function Show-ButtonBar($stealth, $depthMode = $false) {
+function Get-ButtonBarInfo($stealth, $depthMode = $false) {
 
-    $barY = -1
-
-    try { $barY = $host.UI.RawUI.CursorPosition.Y } catch {}
+    # 返回按钮栏的文本、点击区域和颜色，供统一缓冲区或独立输出使用
 
     $buttons = if ($depthMode) {
 
@@ -2607,6 +4430,8 @@ function Show-ButtonBar($stealth, $depthMode = $false) {
 
     $regions = @()
 
+    $textParts = @()
+
     $x = 0
 
     $sep = ' '
@@ -2635,25 +4460,17 @@ function Show-ButtonBar($stealth, $depthMode = $false) {
 
             EndX = $x + $labelW - 1
 
-            Y = $barY
+            Y = -1
 
         }
 
-        if ($stealth) {
-
-            Write-Host $label -ForegroundColor $fg -NoNewline
-
-        } else {
-
-            Write-Host $label -ForegroundColor $fg -BackgroundColor $bg -NoNewline
-
-        }
+        $textParts += $label
 
         $x += $labelW
 
         if ($i -lt $buttons.Count - 1) {
 
-            Write-Host $sep -NoNewline
+            $textParts += $sep
 
             $x += $sepW
 
@@ -2661,13 +4478,123 @@ function Show-ButtonBar($stealth, $depthMode = $false) {
 
     }
 
-    Write-Host ""
+    return [PSCustomObject]@{
 
-    return $regions
+        Text = $textParts -join ''
+
+        Regions = $regions
+
+        Fg = $fg
+
+        Bg = $bg
+
+    }
 
 }
 
-# ---------- 控制台输入（攌�鼠标点击�?----------
+function Show-ButtonBar($stealth, $depthMode = $false) {
+
+    $barY = -1
+
+    try { $barY = $host.UI.RawUI.CursorPosition.Y } catch {}
+
+    $info = Get-ButtonBarInfo $stealth $depthMode
+
+    if ($info.Bg -eq $null) {
+
+        Write-Host $info.Text -ForegroundColor $info.Fg -NoNewline
+
+    } else {
+
+        Write-Host $info.Text -ForegroundColor $info.Fg -BackgroundColor $info.Bg -NoNewline
+
+    }
+
+    Write-Host ""
+
+    foreach ($r in $info.Regions) { $r.Y = $barY }
+
+    return $info.Regions
+
+}
+
+function Clear-RightSide($bottomY, $contentWidth) {
+
+    # 清除内容右侧残留：控制台窗口比表格宽时，旧内容会留在右边。
+
+    if (-not $script:hasConsole -or $bottomY -le 0) { return }
+
+    try {
+
+        $width = [Console]::WindowWidth
+
+        if ($width -le $contentWidth) { return }
+
+        $blank = ' ' * ($width - $contentWidth)
+
+        $prevBg = [Console]::BackgroundColor
+
+        try {
+
+            [Console]::BackgroundColor = [ConsoleColor]::Black
+
+            for ($y = 0; $y -lt $bottomY; $y++) {
+
+                [Console]::SetCursorPosition($contentWidth, $y)
+
+                [Console]::Write($blank)
+
+            }
+
+        } finally {
+
+            [Console]::BackgroundColor = $prevBg
+
+        }
+
+    } catch {}
+
+}
+
+function Clear-BottomLeftover($newBottomY) {
+
+    # 清除本帧缩短后底部残留的旧行。
+
+    if (-not $script:hasConsole) { return }
+
+    try {
+
+        $oldBottomY = $script:frameBottomY
+
+        if ($oldBottomY -le $newBottomY) { return }
+
+        $width = [Console]::WindowWidth
+
+        $blank = ' ' * $width
+
+        $lines = $oldBottomY - $newBottomY
+
+        $prevBg = [Console]::BackgroundColor
+
+        try {
+
+            [Console]::BackgroundColor = [ConsoleColor]::Black
+
+            [Console]::SetCursorPosition(0, $newBottomY)
+
+            [Console]::Write(($blank + "`r`n") * $lines)
+
+        } finally {
+
+            [Console]::BackgroundColor = $prevBg
+
+        }
+
+    } catch {}
+
+}
+
+# ---------- 控制台输入（捕获鼠标点击）----------
 
 $script:consoleInputInitialized = $false
 
@@ -2887,137 +4814,144 @@ function Restore-ConsoleInput {
 
 # ---------- 参数解析 ----------
 
-if ($args -contains '--help' -or $args -contains '-h') {
+$script:HelpLines = @(
+    '用法: watch [刷新秒数] [--index on|off] [--stealth on|off] [--hy on|off] [--once] [-h]',
+    '',
+    '参数:',
+    '  刷新秒数          自动刷新间隔，默认 15 秒',
+    '  --index on|off    是否显示指数方块，默认 off',
+    '                    （隐蔽模式固定显示上证指数、深证成指）',
+    '  --stealth on|off  隐蔽模式（英文、朴素窗口标题），默认 on',
+    '  --hy on|off       获取并显示半年涨跌，默认 off',
+    '  --once            只取一次数据后退出',
+    '  -h, --help        显示此帮助信息',
+    '',
+    'Windows 下命令为 watch.cmd；macOS / Linux 下为 ./watch，参数完全相同。',
+    '',
+    '列表页快捷键:',
+    '  Esc        退出程序',
+    '  R          立即刷新行情',
+    '  C          按涨跌幅排序（高→低，再按一次恢复）',
+    '  V          按量比排序（高→低，再按一次恢复）',
+    '  S          切换隐蔽模式 / 普通模式',
+    '  B / F9     切换 npm 构建日志外观 / 正常行情',
+    '  ↑ / ↓      移动光标选择股票',
+    '  → / Enter  进入选中股票的盘口详情',
+    '',
+    '盘口详情页快捷键:',
+    '  R          刷新盘口',
+    '  ↑ / ↓      切换到上一只 / 下一只自选股盘口',
+    '  ← / Esc    返回列表',
+    '  Ctrl+C     强制退出'
+)
 
-    Write-Host "Usage: watch.cmd [interval] [--index on|off] [--stealth on|off] [--hy on|off] [--once]"
+function Show-Help([bool]$ToError = $false) {
+    foreach ($line in $script:HelpLines) {
+        if ($ToError) { [Console]::Error.WriteLine($line) }
+        else { Write-Output $line }
+    }
+}
 
-    Write-Host ""
+function Fail-Usage([string]$Message) {
+    [Console]::Error.WriteLine("错误: $Message")
+    [Console]::Error.WriteLine("")
+    Show-Help $true
+    exit 2
+}
 
-    Write-Host "List view keys:"
+function ConvertTo-OptBool([string]$Value) {
+    switch ($Value.Trim().ToLowerInvariant()) {
+        'on'    { return $true }
+        'true'  { return $true }
+        '1'     { return $true }
+        'yes'   { return $true }
+        'y'     { return $true }
+        'off'   { return $false }
+        'false' { return $false }
+        '0'     { return $false }
+        'no'    { return $false }
+        'n'     { return $false }
+        default { return $null }
+    }
+}
 
-    Write-Host "  R          refresh quotes"
-
-    Write-Host "  C          sort by change% (high->low->low->high->original)"
-
-    Write-Host "  V          sort by volume ratio (high->low->low->high->original)"
-
-    Write-Host "  S          toggle stealth/home mode"
-
-    Write-Host "  B / F9     toggle boss mode (fake npm build log)"
-
-    Write-Host "  Up/Down    move cursor"
-
-    Write-Host "  Right      enter depth view (5-level bid/ask)"
-
-    Write-Host "  Esc        exit"
-
-    Write-Host ""
-
-    Write-Host "Depth view keys:"
-
-    Write-Host "  R          refresh depth"
-
-    Write-Host "  Up/Down    previous/next stock in list order"
-
-    Write-Host "  Left/Esc   back to list"
-
+if (@($args) -contains '--help' -or @($args) -contains '-h') {
+    Show-Help $false
     exit 0
-
 }
 
 $interval = 15
-
 $showIndex = $false
-
 $stealth = $true
-
 $fetchHy = $false
-
 $once = $false
 
 $i = 0
-
 while ($i -lt $args.Count) {
+    $arg = [string]$args[$i]
 
-    $arg = $args[$i]
-
-    if ($arg -eq '--index' -or $arg -eq '-index') {
-
-        $i++
-
-        if ($i -lt $args.Count -and ($args[$i] -eq 'on' -or $args[$i] -eq 'true')) {
-
-            $showIndex = $true
-
-        } else {
-
-            $showIndex = $false
-
-        }
-
-    } elseif ($arg -eq '--stealth' -or $arg -eq '-stealth') {
-
-        $i++
-
-        if ($i -lt $args.Count -and ($args[$i] -eq 'off' -or $args[$i] -eq 'false')) {
-
-            $stealth = $false
-
-        } else {
-
-            $stealth = $true
-
-        }
-
-    } elseif ($arg -eq '--hy' -or $arg -eq '-hy') {
-
-        $i++
-
-        if ($i -lt $args.Count -and ($args[$i] -eq 'on' -or $args[$i] -eq 'true')) {
-
-            $fetchHy = $true
-
-        } else {
-
-            $fetchHy = $false
-
-        }
-
-    } elseif ($arg -eq '--once' -or $arg -eq '-once') {
-
+    if ($arg -eq '--once' -or $arg -eq '-once') {
         $once = $true
-
-    } else {
-
-        try {
-
-            $parsed = [int]$arg
-
-            if ($parsed -gt 0) {
-
-                $interval = $parsed
-
-            }
-
-        } catch {
-
-            # ignore non-integer argument
-
-        }
-
+        $i++
+        continue
     }
 
-    $i++
+    if ($arg.StartsWith('-')) {
+        $optName = $arg.TrimStart([char]'-')
+        $optValue = $null
+        $eqIndex = $optName.IndexOf('=')
+        if ($eqIndex -ge 0) {
+            $optValue = $optName.Substring($eqIndex + 1)
+            $optName = $optName.Substring(0, $eqIndex)
+        }
+        $optName = $optName.ToLowerInvariant()
+        if (@('index', 'stealth', 'hy') -notcontains $optName) {
+            Fail-Usage "无法识别的参数: $arg"
+        }
+        if ($null -eq $optValue) {
+            $i++
+            if ($i -ge $args.Count -or ([string]$args[$i]).StartsWith('-')) {
+                Fail-Usage "--$optName 需要 on 或 off"
+            }
+            $optValue = [string]$args[$i]
+        }
+        $optBool = ConvertTo-OptBool $optValue
+        if ($null -eq $optBool) {
+            Fail-Usage "--$optName 的值必须是 on 或 off（收到: $optValue）"
+        }
+        switch ($optName) {
+            'index'   { $showIndex = $optBool }
+            'stealth' { $stealth = $optBool }
+            'hy'      { $fetchHy = $optBool }
+        }
+        $i++
+        continue
+    }
 
+    $parsedInt = 0
+    if (-not [int]::TryParse($arg, [ref]$parsedInt)) {
+        Fail-Usage "无法识别的参数: $arg"
+    }
+    if ($parsedInt -le 0) {
+        Fail-Usage "刷新秒数必须大于 0（收到: $arg）"
+    }
+    $interval = $parsedInt
+    $i++
 }
 
-# ---------- 初��?----------
+# ---------- 初始化 ----------
 
 Load-SecidCache
 
 Load-HyCache
 
 Load-MarketTotalCache
+
+Load-MaCache
+
+Load-PepbCache
+
+Load-DepthCache
 
 $hasConsole = $false
 
@@ -3033,13 +4967,25 @@ try {
 
 }
 
+$script:hasConsole = $hasConsole
+
 if ($hasConsole -and $stealth) {
 
     try { $host.ui.RawUI.WindowTitle = "System" } catch {}
 
 }
 
-# ---------- 主流�?----------
+# 上一帧底部行号，用于清除本帧缩短后留下的旧行
+$script:frameBottomY = 0
+
+# 上一帧内容，用于 Stealth 模式差异重绘，只改写变化的行
+$script:lastFrameLines = $null
+
+$script:lastWindowWidth = if ($hasConsole) { [Console]::WindowWidth } else { 0 }
+
+$script:lastWindowHeight = if ($hasConsole) { [Console]::WindowHeight } else { 0 }
+
+# ---------- 主循环 ----------
 
 if ($once) {
 
@@ -3047,9 +4993,31 @@ if ($once) {
 
     if ($err) {
 
-        Write-Host $err
+        [Console]::Error.WriteLine($err)
 
         exit 1
+
+    }
+
+    $script:lastQuoteSuccess = Get-Date
+
+    foreach ($row in @($stockRows) + @($indexRows)) {
+
+        $script:quoteSuccessTimes["$($row.f13).$($row.f12)"] = $script:lastQuoteSuccess
+
+    }
+
+    if ($indexRows.Count -gt 0) {
+
+        [void](Start-MarketTotalUpdate @('1.000001', '0.399001', '0.899050'))
+
+        while ($script:marketTotalJob -ne $null -and $script:marketTotalJob.State -eq 'Running') {
+
+            Start-Sleep -Milliseconds 50
+
+        }
+
+        $null = Complete-MarketTotalUpdate
 
     }
 
@@ -3085,11 +5053,11 @@ try {
 
     $bossMode = $false
 
-    $sortState = @{ c = 0; v = 0 }  # 0=原样, 1=从高到低, 2=从低到高
+    $sortState = @{ c = 0; v = 0 }  # 0=原样, 1=从高到低
 
-    $cursorIndex = 0                  # 游标默�在��参��?
+    $cursorIndex = 0                  # 游标默认在首条数据
 
-    $depthMode = $false               # 昐�处于丂�盘口详情�?
+    $depthMode = $false               # 是否处于盘口详情模式
 
     $depthSecid = $null
 
@@ -3103,9 +5071,31 @@ try {
 
         try {
 
-            if ($first) {
+            if ($hasConsole -and ([Console]::WindowWidth -ne $script:lastWindowWidth -or [Console]::WindowHeight -ne $script:lastWindowHeight)) {
+
+                $script:lastWindowWidth = [Console]::WindowWidth
+
+                $script:lastWindowHeight = [Console]::WindowHeight
+
+                $script:lastFrameLines = $null
+
+                $script:depthViewDrawn = $false
+
+                $script:depthViewLast = $null
 
                 Clear-Host
+
+            }
+
+            $null = Complete-QuoteUpdate
+
+            $null = Complete-DepthUpdate
+
+            $null = Complete-MarketTotalUpdate
+
+            if ($first) {
+
+                if (-not $stealth) { Clear-Host }
 
                 $first = $false
 
@@ -3117,7 +5107,7 @@ try {
 
                 } catch {
 
-                    Clear-Host
+                    if (-not $stealth) { Clear-Host }
 
                 }
 
@@ -3135,7 +5125,7 @@ try {
 
                 if ((Get-Date) -ge $depthNextRefreshTime) {
 
-                    $depthNextRefreshTime = (Get-Date).AddSeconds(5)
+                    $depthNextRefreshTime = (Get-Date).AddSeconds(10)
 
                 }
 
@@ -3155,17 +5145,31 @@ try {
 
                 if ($cursorIndex -ge $displayRows.Count) { $cursorIndex = [math]::Max(0, $displayRows.Count - 1) }
 
-                Print-Quotes $displayRows $indexRows $showIndex $stealth $cursorIndex
+                # stealth 模式下把按钮栏也纳入统一缓冲区，避免单独重绘闪烁
+
+                $buttonInfo = $null
+
+                $buttonRegions = $null
+
+                if ($stealth) {
+
+                    $buttonInfo = Get-ButtonBarInfo $stealth $false
+
+                    $buttonRegions = $buttonInfo.Regions
+
+                }
+
+                Print-Quotes $displayRows $indexRows $showIndex $stealth $cursorIndex $buttonInfo.Text
 
             }
 
             if ($fetchHy -and $script:stockQuoteCache.Count -gt 0) {
 
-                # 每�徎�先应用已完成的后台结果，硿�缓存数据尽快�
+                # 每轮优先应用已完成的后台结果，让缓存数据尽快生效
 
                 Complete-HalfYearUpdate
 
-                # 实际发起新的半年涨跌请求则按 4 倍自动刷新间隔控�?
+                # 实际发起新的半年涨跌请求则按 4 倍自动刷新间隔控制
 
                 if ((Get-Date) -ge $script:nextHyStartTime) {
 
@@ -3177,29 +5181,53 @@ try {
 
             }
 
+            # 应用后台 PE/PB 结果
+
+            $null = Complete-PepbUpdate
+
         } catch {
 
-            if ($first) { Clear-Host; $first = $false }
+            if ($first) { if (-not $stealth) { Clear-Host }; $first = $false }
 
             Write-Host "[error] display failed: $_"
 
         }
 
-        $buttonRegions = $null
+        # stealth 列表页已经在 Print-Quotes 里统一输出按钮栏；
 
-        if (-not $bossMode) {
+        # 这里只处理 depth 视图和非 stealth 模式
+
+        if ($depthMode -and -not $bossMode) {
 
             Write-Host ""
 
-            if ($depthMode) { Write-Host "" }
+            Write-Host ""
 
             $buttonRegions = Show-ButtonBar $stealth $depthMode
+
+        } elseif (-not $bossMode -and -not $stealth) {
+
+            Write-Host ""
+
+            $buttonRegions = Show-ButtonBar $stealth $depthMode
+
+            # 清除本帧右侧和底部残留，避免旧内容/错误信息残留在屏幕上
+
+            try {
+
+                $newBottomY = [Console]::CursorPosition.Y
+
+                Clear-RightSide $newBottomY $NORMAL_TABLE_WIDTH
+
+                Clear-BottomLeftover $newBottomY
+
+                $script:frameBottomY = $newBottomY
+
+            } catch {}
 
         }
 
         if ($hasConsole) {
-
-            $useConsoleInput = Initialize-ConsoleInput
 
             $slept = 0
 
@@ -3209,33 +5237,45 @@ try {
 
                 $slept += 10
 
-                # 盘口详情�?5 秒自动刷�?
+                if (Complete-QuoteUpdate) { if (-not $bossMode) { break } }
+
+                if (Complete-DepthUpdate) { if ($depthMode -and -not $bossMode) { break } }
+
+                if (Complete-MarketTotalUpdate) { if (-not $bossMode) { break } }
+
+                # 盘口详情每 10 秒自动刷新
 
                 if ($depthMode -and (Get-Date) -ge $depthNextRefreshTime) {
 
-                    $depthNextRefreshTime = (Get-Date).AddSeconds(5)
+                    $depthNextRefreshTime = (Get-Date).AddSeconds(10)
 
                     break
 
                 }
 
-                # 分块增量刷新：到点就拉取下一块并立即重绘（盘口页内暂停）
+                # 盘口后台数据（五档/均线/PEPB）到达后立即重绘，不等自动刷新周期
+
+                if ($depthMode) {
+
+                    if (Complete-MaUpdate) { break }
+
+                    if (Complete-PepbUpdate) { break }
+
+                }
+
+                # 分块增量刷新：到点只更新缓存，不立即 break 重绘，
+
+                # 避免部分行频繁单独闪烁；屏幕在 interval 到期时统一重绘
 
                 if (-not $bossMode -and -not $depthMode -and (Get-Date) -ge $script:nextChunkTime) {
 
                     Update-NextChunk $stealth
 
-                    break
-
                 }
 
                 $inputEvent = $null
 
-                if ($useConsoleInput) {
-
-                    $inputEvent = Read-ConsoleInputEvent
-
-                } elseif ([Console]::KeyAvailable) {
+                if ([Console]::KeyAvailable) {
 
                     $inputEvent = [PSCustomObject]@{ Type = 'Key'; Key = [Console]::ReadKey($true).Key }
 
@@ -3268,6 +5308,8 @@ try {
                             ([ConsoleKey]::DownArrow) { $action = if ($depthMode) { 'DepthNext' } else { 'CursorDown' } }
 
                             ([ConsoleKey]::RightArrow) { $action = if ($depthMode) { $null } else { 'DepthEnter' } }
+
+                            ([ConsoleKey]::Enter) { $action = if ($depthMode) { $null } else { 'DepthEnter' } }
 
                             ([ConsoleKey]::LeftArrow) { $action = if ($depthMode) { 'DepthExit' } else { $null } }
 
@@ -3325,23 +5367,36 @@ try {
 
                                 if ($depthMode) {
 
-                                    $depthNextRefreshTime = (Get-Date).AddSeconds(5)
+                                    $script:depthCache.Remove($script:depthSecid)
+
+                                    if ($script:depthUpdateJob -ne $null) {
+
+                                        Stop-Job $script:depthUpdateJob -ErrorAction SilentlyContinue
+
+                                        Remove-Job $script:depthUpdateJob -Force -ErrorAction SilentlyContinue
+
+                                        $script:depthUpdateJob = $null
+
+                                    }
+
+                                    $script:depthJobSecid = $null
+
+                                    $script:depthPending = $null
+
+                                    Start-DepthUpdate $script:depthSecid $script:depthRow.f14
+
+                                    $depthNextRefreshTime = (Get-Date).AddSeconds(10)
+
 
                                     break poll
 
                                 } else {
 
-                                    $err = Initialize-Quotes $stealth
+                                    $allSecids = @($script:stockSecids) + @($script:indexSecids)
 
-                                    if ($err) {
+                                    if (Start-QuoteUpdate $allSecids $stealth 10) {
 
-                                        Clear-Host
-
-                                        Write-Host $err
-
-                                    } else {
-
-                                        Clear-Host
+                                        $script:nextChunkTime = (Get-Date).AddSeconds($script:chunkInterval)
 
                                     }
 
@@ -3361,7 +5416,9 @@ try {
 
                                 } else {
 
-                                    Clear-Host
+                                    $script:lastFrameLines = $null
+
+                                    if (-not $stealth) { Clear-Host }
 
                                 }
 
@@ -3387,11 +5444,15 @@ try {
 
                                 }
 
-                                # 切换模式后重新初始化，避免字段不匹配
+                                # 模式所需字段由后台全量刷新补齐，保留当前缓存和按键响应
 
-                                Initialize-Quotes $stealth | Out-Null
+                                $allSecids = @($script:stockSecids) + @($script:indexSecids)
 
-                                Clear-Host
+                                [void](Start-QuoteUpdate $allSecids $stealth 10)
+
+                                $script:lastFrameLines = $null
+
+                                if (-not $stealth) { Clear-Host }
 
                                 break poll
 
@@ -3403,7 +5464,7 @@ try {
 
                                 $sortState.v = 0
 
-                                Clear-Host
+                                if (-not $stealth) { Clear-Host }
 
                                 break poll
 
@@ -3415,7 +5476,7 @@ try {
 
                                 $sortState.c = 0
 
-                                Clear-Host
+                                if (-not $stealth) { Clear-Host }
 
                                 break poll
 
@@ -3423,17 +5484,21 @@ try {
 
                             'CursorUp' {
 
+                                $oldCursor = $cursorIndex
+
                                 $cursorIndex = if ($displayRows.Count -gt 0) { ($cursorIndex - 1 + $displayRows.Count) % $displayRows.Count } else { 0 }
 
-                                break poll
+                                Update-Cursor $oldCursor $cursorIndex $displayRows $stealth
 
                             }
 
                             'CursorDown' {
 
+                                $oldCursor = $cursorIndex
+
                                 $cursorIndex = if ($displayRows.Count -gt 0) { ($cursorIndex + 1) % $displayRows.Count } else { 0 }
 
-                                break poll
+                                Update-Cursor $oldCursor $cursorIndex $displayRows $stealth
 
                             }
 
@@ -3467,7 +5532,7 @@ try {
 
                                     $script:depthSecid = "$($script:depthRow.f13).$($script:depthRow.f12)"
 
-                                    $script:depthNextRefreshTime = (Get-Date).AddSeconds(5)
+                                    $script:depthNextRefreshTime = (Get-Date).AddSeconds(10)
 
                                     $script:depthViewDrawn = $false
 
@@ -3489,7 +5554,7 @@ try {
 
                                     $script:depthSecid = "$($script:depthRow.f13).$($script:depthRow.f12)"
 
-                                    $script:depthNextRefreshTime = (Get-Date).AddSeconds(5)
+                                    $script:depthNextRefreshTime = (Get-Date).AddSeconds(10)
 
                                     $script:depthViewDrawn = $false
 
@@ -3511,7 +5576,7 @@ try {
 
         } else {
 
-            # 非控制台�下仍然分块刷�?
+            # 非控制台环境下仍然分块刷新
 
             $slept = 0
 
@@ -3525,8 +5590,6 @@ try {
 
                     Update-NextChunk $stealth
 
-                    break
-
                 }
 
             }
@@ -3539,6 +5602,26 @@ try {
 
     Restore-ConsoleInput
 
+    if ($script:quoteUpdateJob -ne $null) {
+
+        Stop-Job $script:quoteUpdateJob -ErrorAction SilentlyContinue
+
+        Remove-Job $script:quoteUpdateJob -Force -ErrorAction SilentlyContinue
+
+        $script:quoteUpdateJob = $null
+
+    }
+
+    if ($script:marketTotalJob -ne $null) {
+
+        Stop-Job $script:marketTotalJob -ErrorAction SilentlyContinue
+
+        Remove-Job $script:marketTotalJob -Force -ErrorAction SilentlyContinue
+
+        $script:marketTotalJob = $null
+
+    }
+
     if ($script:hyUpdateJob -ne $null) {
 
         Stop-Job $script:hyUpdateJob -ErrorAction SilentlyContinue
@@ -3546,6 +5629,36 @@ try {
         Remove-Job $script:hyUpdateJob -Force -ErrorAction SilentlyContinue
 
         $script:hyUpdateJob = $null
+
+    }
+
+    if ($script:pepbUpdateJob -ne $null) {
+
+        Stop-Job $script:pepbUpdateJob -ErrorAction SilentlyContinue
+
+        Remove-Job $script:pepbUpdateJob -Force -ErrorAction SilentlyContinue
+
+        $script:pepbUpdateJob = $null
+
+    }
+
+    if ($script:depthUpdateJob -ne $null) {
+
+        Stop-Job $script:depthUpdateJob -ErrorAction SilentlyContinue
+
+        Remove-Job $script:depthUpdateJob -Force -ErrorAction SilentlyContinue
+
+        $script:depthUpdateJob = $null
+
+    }
+
+    if ($script:maUpdateJob -ne $null) {
+
+        Stop-Job $script:maUpdateJob -ErrorAction SilentlyContinue
+
+        Remove-Job $script:maUpdateJob -Force -ErrorAction SilentlyContinue
+
+        $script:maUpdateJob = $null
 
     }
 
@@ -3559,6 +5672,6 @@ try {
 
     Clear-Host
 
-    Write-Host "Exited"
+    Write-Host "已退出"
 
 }

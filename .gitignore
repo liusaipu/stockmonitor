@@ -16,3 +16,10 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Additional runtime caches/logs
+.ma_cache.json
+.pepb_cache.json
+.depth_cache.json
+.frame_log.txt
+*.zip

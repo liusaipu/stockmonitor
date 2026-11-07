@@ -1,14 +1,33 @@
 #!/bin/sh
 # 股票行情监视器统一入口
-# macOS / Linux : 直接运行 Python 版本
-# Windows (Git Bash / MSYS2 / Cygwin) : 转交给 watch.cmd
+# macOS / Linux : 直接使用 Python 版
+# Windows (Git Bash / MSYS2 / Cygwin) : 转交给 watch.cmd（PowerShell 版）
+set -u
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SOURCE=$0
+while [ -h "$SOURCE" ]; do
+    DIR=$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)
+    SOURCE=$(readlink "$SOURCE")
+    case $SOURCE in
+        /*) ;;
+        *) SOURCE=$DIR/$SOURCE ;;
+    esac
+done
+SCRIPT_DIR=$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)
 
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
-        exec "$SCRIPT_DIR/watch.cmd" "$@"
+        if [ -f "$SCRIPT_DIR/watch.cmd" ]; then
+            if command -v cygpath >/dev/null 2>&1 && command -v cmd.exe >/dev/null 2>&1; then
+                exec cmd.exe //c "$(cygpath -w "$SCRIPT_DIR/watch.cmd")" "$@"
+            fi
+            exec "$SCRIPT_DIR/watch.cmd" "$@"
+        fi
         ;;
 esac
+
+if [ -f "$SCRIPT_DIR/watch.sh" ]; then
+    exec sh "$SCRIPT_DIR/watch.sh" "$@"
+fi
 
 exec python3 "$SCRIPT_DIR/watch_quotes.py" "$@"

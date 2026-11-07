@@ -1,5 +1,9 @@
 """
-股票行情核心库 —— 共享工具函数与数据源接口。
+股票行情核心库 —— 数据源、缓存、格式化与终端工具。
+
+Windows（watch_quotes.ps1）与 macOS/Linux（watch_quotes.py）共用同一套
+磁盘缓存文件，因此这里所有 JSON 读写都按「UTF-8、无 BOM、原子替换」处理，
+读取时兼容 PowerShell 5.1 写出的带 BOM 文件。
 
 字段映射（东方财富 push2 / 新浪通用字段名）：
   f2  = 最新价       f3  = 涨跌幅(%)
@@ -11,21 +15,22 @@
   f17 = 今开         f18 = 昨收
 """
 
+import calendar
 import concurrent.futures
 import datetime
 import json
+import os
 import re
 import shutil
-import socket
 import ssl
 import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
-import urllib.request
 import urllib.parse
-import os
+import urllib.request
 
 # ── 字段名常量 ──────────────────────────────────────────────
 F_PRICE       = 'f2'   # 最新价
@@ -44,120 +49,261 @@ F_OPEN        = 'f17'  # 今开
 F_PREV_CLOSE  = 'f18'  # 昨收
 F_TOTAL_CAP   = 'f20'  # 总市值
 F_FLOAT_CAP   = 'f21'  # 流通市值
+F_PE          = 'f9'   # 市盈率
+F_PB          = 'f23'  # 市净率
 F_LATEST_VOL  = 'f30'  # 现手（最近成交手）
 
 # ── 脚本所在目录 ────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SECID_CACHE_FILE = os.path.join(BASE_DIR, '.secids_cache.json')
+HY_CACHE_FILE = os.path.join(BASE_DIR, '.hy_pct_cache.json')
+MARKET_TOTAL_CACHE_FILE = os.path.join(BASE_DIR, '.market_total_cache.json')
+MA_CACHE_FILE = os.path.join(BASE_DIR, '.ma_cache.json')
+PEPB_CACHE_FILE = os.path.join(BASE_DIR, '.pepb_cache.json')
+
+# 统一的 UA；部分行情接口对空 UA 或 Python-urllib 直接拒绝
+_UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+       'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36')
+
+
+def log_message(message):
+    """按需把诊断信息写入 .frame_log.txt（设置 WATCH_FRAME_LOG=1 时）。"""
+    if os.environ.get('WATCH_FRAME_LOG') != '1':
+        return
+    try:
+        line = f"{time.strftime('%H:%M:%S')} {message}\n"
+        with open(os.path.join(BASE_DIR, '.frame_log.txt'), 'a', encoding='utf-8') as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+# ── JSON 缓存：读取兼容 BOM，写入无 BOM 且原子替换 ──────────
+
+def load_json_cache(path, default=None):
+    """读取 JSON 缓存；兼容 PowerShell 5.1 写出的 UTF-8 BOM 文件。"""
+    try:
+        with open(path, 'r', encoding='utf-8-sig') as f:
+            return json.load(f)
+    except (OSError, ValueError, TypeError):
+        return {} if default is None else default
+
+
+def save_json_cache(path, data):
+    """原子保存 JSON 缓存，不写 BOM，供 Windows/macOS 共用。"""
+    temp_path = f'{path}.tmp.{os.getpid()}'
+    try:
+        with open(temp_path, 'w', encoding='utf-8', newline='\n') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, path)
+    except OSError as e:
+        log_message(f'cache save failed: {path}: {e}')
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
 
 # ── 3市场成交总额缓存与对应指数 ──────────────────────────────
-MARKET_TOTAL_CACHE_FILE = os.path.join(BASE_DIR, '.market_total_cache.json')
 MARKET_TOTAL_SECIDS = {
     'sh': '1.000001',   # 上证指数 -> 沪市
     'sz': '0.399001',   # 深证成指 -> 深市
     'bj': '0.899050',   # 北证50   -> 北市
 }
 
-# ── 名称 -> secid 本地缓存（与 PowerShell 版共用 .secids_cache.json）────────
-_SECID_CACHE_FILE = os.path.join(BASE_DIR, '.secids_cache.json')
-_SECID_CACHE = None
-
-
-def _load_secid_cache():
-    """加载并返回名称到 secid 的本地缓存。"""
-    global _SECID_CACHE
-    if _SECID_CACHE is None:
-        try:
-            with open(_SECID_CACHE_FILE, 'r', encoding='utf-8') as f:
-                _SECID_CACHE = json.load(f)
-        except Exception:
-            _SECID_CACHE = {}
-    return _SECID_CACHE
-
-
-def _save_secid_cache():
-    """保存名称到 secid 的本地缓存。"""
-    try:
-        with open(_SECID_CACHE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(_SECID_CACHE or {}, f, ensure_ascii=False, indent=4)
-    except Exception:
-        pass
-
-
 # ── 上证/深证指数识别正则 ───────────────────────────────────
 _RE_SH_INDEX      = re.compile(r'^000(001|688)$')
-_RE_SZ_BJ_INDEX   = re.compile(r'^(399|899|930)\d{3}$')
+_RE_SZ_INDEX      = re.compile(r'^(399|930)\d{3}$')
+_RE_BJ_INDEX      = re.compile(r'^899\d{3}$')
+_RE_BJ_STOCK      = re.compile(r'^(4|8|92)\d{4,5}$')
 
-# ── SSL 证书降级标志（macOS 默认 Python 证书缺失时只警告一次）─────────
+
+# ── HTTP 层：证书降级 + curl 兜底 ───────────────────────────
+#
+# macOS 上通过 python.org 安装的 Python 经常没有安装根证书，直接访问会报
+# CERTIFICATE_VERIFY_FAILED；个别网络环境下 urllib 还会被行情服务器
+# 直接断开（RemoteDisconnected）。为提高可用性：
+#   1. 优先使用系统/ certifi 证书正常校验；
+#   2. 证书校验失败时降级为不校验（只警告一次）；
+#   3. urllib 失败时，若系统有 curl 则用 curl 重试（它走独立的 TLS 栈）。
+
+_SSL_CONTEXT = None
 _SSL_WARNED = False
 
 
-def _urlopen(req, timeout):
-    """封装 urlopen，macOS 证书验证失败时自动降级到不验证证书。"""
-    global _SSL_WARNED
-    old_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(timeout)
-    try:
+def _ssl_context():
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is None:
         try:
-            return urllib.request.urlopen(req, timeout=timeout)
-        except urllib.error.URLError as e:
-            reason = getattr(e, 'reason', e)
-            if isinstance(reason, ssl.SSLError) and 'CERTIFICATE_VERIFY_FAILED' in str(reason):
-                if not _SSL_WARNED:
-                    print('[warn] 系统 SSL 证书验证失败，尝试不验证证书继续访问...')
-                    _SSL_WARNED = True
-                ctx = ssl._create_unverified_context()
-                return urllib.request.urlopen(req, timeout=timeout, context=ctx)
-            raise
-    finally:
-        socket.setdefaulttimeout(old_timeout)
+            import certifi  # 可选依赖，装了就优先用
+            _SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            _SSL_CONTEXT = ssl.create_default_context()
+    return _SSL_CONTEXT
 
 
-def _fetch_text_curl(url, timeout=10):
-    """当 urllib 被服务端识别为异常流量时，用 curl 兜底取回文本。"""
-    if not shutil.which('curl'):
-        return None
+def _is_cert_error(exc):
+    reason = getattr(exc, 'reason', exc)
+    text = str(reason)
+    return isinstance(reason, ssl.SSLError) and (
+        'CERTIFICATE_VERIFY_FAILED' in text or 'certificate verify failed' in text
+    )
+
+
+def _warn_ssl_once():
+    global _SSL_WARNED
+    if _SSL_WARNED:
+        return
+    _SSL_WARNED = True
+    log_message('SSL certificate verification failed; retrying without verification')
+    if sys.stderr.isatty():
+        print('[warn] 系统 SSL 证书校验失败，已临时跳过校验；'
+              '建议运行 Python 安装目录下的 Install Certificates.command',
+              file=sys.stderr)
+
+
+def _http_get_bytes(url, timeout=15, extra_headers=None):
+    """urllib GET，证书校验失败时自动降级。"""
+    headers = {
+        'User-Agent': _UA,
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, headers=headers)
     try:
-        out = subprocess.check_output(
-            ['curl', '-s', '-L', '--max-time', str(timeout),
-             '-A', 'Mozilla/5.0', url],
-            stderr=subprocess.DEVNULL,
-            timeout=timeout + 2,
-        )
-        return out.decode('utf-8')
-    except Exception:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
+            return resp.read()
+    except urllib.error.URLError as e:
+        if not _is_cert_error(e):
+            raise
+        _warn_ssl_once()
+        context = ssl._create_unverified_context()
+        with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
+            return resp.read()
+
+
+def _curl_bytes(url, timeout=15, extra_headers=None):
+    """用系统 curl 兜底取回原始字节；没有 curl 时返回 None。"""
+    if os.environ.get('WATCH_DISABLE_CURL') == '1':
         return None
+    curl = shutil.which('curl')
+    if not curl:
+        return None
+    args = [
+        curl, '-sS', '--compressed', '-L', '--max-time', str(int(timeout)),
+        '-A', _UA,
+    ]
+    if extra_headers:
+        for key, value in extra_headers.items():
+            args += ['-H', f'{key}: {value}']
+    args.append(url)
+    kwargs = {}
+    if os.name == 'nt':
+        kwargs['creationflags'] = 0x08000000  # CREATE_NO_WINDOW
+    try:
+        proc = subprocess.run(
+            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout + 2, **kwargs
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log_message(f'curl fallback failed: {e}')
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        detail = proc.stderr.decode('utf-8', errors='replace').strip()[:200]
+        log_message(f'curl fallback failed ({proc.returncode}): {detail}')
+        return None
+    return proc.stdout
+
+
+def _parse_json(raw):
+    """解析 JSON，兼容部分接口返回的 JSONP 包装。"""
+    text = raw.decode('utf-8-sig', errors='replace')
+    try:
+        return json.loads(text)
+    except ValueError:
+        match = re.match(r'^\s*[\w$.]+\s*\((.*)\)\s*;?\s*$', text, re.S)
+        if match:
+            return json.loads(match.group(1))
+        raise
 
 
 def fetch(url, timeout=15, retries=1, extra_headers=None):
-    """HTTP GET 并解析 JSON，支持自动重试。"""
+    """HTTP GET 并解析 JSON：urllib 失败时自动改用 curl，支持重试。"""
     last_err = None
-    for i in range(retries):
+    attempts = max(1, int(retries))
+    for i in range(attempts):
         try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            if extra_headers:
-                headers.update(extra_headers)
-            req = urllib.request.Request(url, headers=headers)
-            with _urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode('utf-8'))
+            return _parse_json(_http_get_bytes(url, timeout, extra_headers))
         except Exception as e:
             last_err = e
-            if i < retries - 1:
-                time.sleep(0.2 * (i + 1))
-    raise last_err
+            log_message(f'urllib fetch failed: {url.split("?")[0]}: {e}')
+            raw = _curl_bytes(url, timeout, extra_headers)
+            if raw is not None:
+                try:
+                    return _parse_json(raw)
+                except Exception as ce:
+                    last_err = ce
+                    log_message(f'curl response parse failed: {ce}')
+        if i < attempts - 1:
+            time.sleep(0.25 * (i + 1))
+    raise RuntimeError(f'请求失败: {url.split("?")[0]}: {last_err}') from last_err
 
+
+def fetch_via_curl(url, timeout=15, extra_headers=None):
+    """强制通过 curl 取 JSON。
+
+    某些网络环境下 urllib 会被搜索接口返回另一套（无关的）结果，
+    但 HTTP 状态仍是 200，只有在解析后校验响应结构才能发现。
+    """
+    raw = _curl_bytes(url, timeout, extra_headers)
+    if raw is None:
+        raise RuntimeError(f'curl 不可用或请求失败: {url.split("?")[0]}')
+    return _parse_json(raw)
+
+
+def fetch_text(url, timeout=15, encoding='utf-8', extra_headers=None):
+    """HTTP GET 并解码文本；urllib 失败时自动改用 curl。"""
+    last_err = None
+    try:
+        return _http_get_bytes(url, timeout, extra_headers).decode(encoding, errors='replace')
+    except Exception as e:
+        last_err = e
+        log_message(f'urllib text fetch failed: {url.split("?")[0]}: {e}')
+    raw = _curl_bytes(url, timeout, extra_headers)
+    if raw is not None:
+        return raw.decode(encoding, errors='replace')
+    raise RuntimeError(f'请求失败: {url.split("?")[0]}: {last_err}') from last_err
+
+
+# ── 新浪代码转换与解析 ──────────────────────────────────────
 
 def secid_to_sina_code(secid):
-    """将东方财富 secid (如 1.600519) 转换为新浪代码 (如 sh600519)。"""
+    """将东方财富 secid (如 1.600519) 转换为新浪代码 (如 sh600519)。
+
+    北交所实时行情/指数在新浪使用 bj 前缀（如 bj430047、s_bj899050），
+    不能沿用深市的 sz 前缀，否则兜底数据源会返回空。
+    """
     if '.' in secid:
         market, code = secid.split('.', 1)
     else:
         market, code = '0', secid
-    prefix = {'0': 'sz', '1': 'sh'}.get(market, 'bj')
-    if (market == '1' and _RE_SH_INDEX.match(code)) or \
-       (market == '0' and _RE_SZ_BJ_INDEX.match(code)):
-        prefix = 's_' + prefix
+    if market == '1':
+        prefix = 's_sh' if _RE_SH_INDEX.match(code) else 'sh'
+    elif market == '0':
+        if _RE_BJ_INDEX.match(code):
+            prefix = 's_bj'
+        elif _RE_SZ_INDEX.match(code):
+            prefix = 's_sz'
+        elif _RE_BJ_STOCK.match(code):
+            prefix = 'bj'
+        else:
+            prefix = 'sz'
+    else:
+        prefix = 'bj'
+        if _RE_BJ_INDEX.match(code):
+            prefix = 's_bj'
     return prefix + code
 
 
@@ -180,7 +326,7 @@ def parse_sina_quote_response(text):
         elif re.search(r'^s?_?sz', sina_code):
             market_num = '0'
         elif re.search(r'^s?_?bj', sina_code):
-            market_num = 'other'
+            market_num = '0'
         else:
             market_num = '1'
 
@@ -203,19 +349,25 @@ def parse_sina_quote_response(text):
                 p = float(parts[1])
                 c = float(parts[2])
                 row[F_PREV_CLOSE] = round(p - c, 4)
-            except Exception:
+            except (TypeError, ValueError):
                 pass
         else:
             # 个股
             if len(parts) < 6:
                 continue
+            vol = '-'
+            if len(parts) > 8:
+                try:
+                    vol = str(int(float(parts[8])) // 100)
+                except (TypeError, ValueError):
+                    vol = '-'
             row.update({
                 F_PRICE: parts[3],
                 F_PREV_CLOSE: parts[2],
                 F_OPEN: parts[1],
                 F_HIGH: parts[4],
                 F_LOW: parts[5],
-                F_VOL: str(int(parts[8]) // 100) if len(parts) > 8 and parts[8].isdigit() else '-',
+                F_VOL: vol,
                 F_AMT: parts[9] if len(parts) > 9 else '-'
             })
             try:
@@ -223,7 +375,7 @@ def parse_sina_quote_response(text):
                 pc = float(parts[2])
                 row[F_CHG] = round(p - pc, 3)
                 row[F_PCT_CHG] = round((p - pc) / pc * 100, 2) if pc != 0 else 0
-            except Exception:
+            except (TypeError, ValueError):
                 row[F_CHG] = '-'
                 row[F_PCT_CHG] = '-'
         rows.append(row)
@@ -237,32 +389,33 @@ def fetch_quotes_sina(secids, retries=1):
     sina_codes = [secid_to_sina_code(s) for s in secids]
     url = 'https://hq.sinajs.cn/list=' + ','.join(sina_codes)
     last_err = None
-    for i in range(retries):
+    attempts = max(1, int(retries))
+    for i in range(attempts):
         try:
-            req = urllib.request.Request(url, headers={
-                'Referer': 'https://finance.sina.com.cn/'
-            })
-            with _urlopen(req, timeout=15) as resp:
-                # 使用 gbk 解码（gb2312 的超集，更安全）
-                text = resp.read().decode('gbk', errors='replace')
+            text = fetch_text(
+                url, timeout=15, encoding='gbk',
+                extra_headers={'Referer': 'https://finance.sina.com.cn/'}
+            )
             return parse_sina_quote_response(text)
         except Exception as e:
             last_err = e
-            if i < retries - 1:
+            if i < attempts - 1:
                 time.sleep(0.3 * (i + 1))
     raise last_err
 
 
+# ── 格式化工具 ──────────────────────────────────────────────
+
 def fmt_num(v, digits=2, divisor=1):
     """格式化数字：千分位、指定小数位、可除数转换。"""
-    if v in (None, '-', '', '0', 0, '0.0'):
+    if v in (None, '-', ''):
         return '-'
     try:
         f = float(v) / divisor
         if digits == 0:
-            return f"{int(f):,}"
+            return f"{round(f):,}"
         return f"{f:,.{digits}f}"
-    except Exception:
+    except (TypeError, ValueError):
         return str(v)
 
 
@@ -277,52 +430,55 @@ def fmt_price(v, row):
     return fmt_num(v, digits=3 if is_etf(row) else 2)
 
 
+def char_width(c):
+    if unicodedata.combining(c):
+        return 0
+    return 2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1
+
+
 def display_width(s):
-    """计算字符串显示宽度（CJK 字符算 2）。"""
-    w = 0
-    for c in str(s):
-        w += 2 if ord(c) > 127 else 1
-    return w
+    """按 East Asian Width 计算终端显示宽度。"""
+    return sum(char_width(c) for c in str(s))
 
 
 def pad_center(s, width):
     s = str(s)
     sw = display_width(s)
-    left = (width - sw) // 2
-    right = width - sw - left
+    left = max(0, (width - sw) // 2)
+    right = max(0, width - sw - left)
     return ' ' * left + s + ' ' * right
 
 
 def pad_left(s, width):
     s = str(s)
     sw = display_width(s)
-    pad = width - sw
-    if pad < 0:
-        pad = 0
-    return ' ' * pad + s
+    return ' ' * max(0, width - sw) + s
 
 
 def pad_right(s, width):
     s = str(s)
     sw = display_width(s)
-    pad = width - sw
-    if pad < 0:
-        pad = 0
-    return s + ' ' * pad
+    return s + ' ' * max(0, width - sw)
 
 
 def truncate_name(s, max_width=8):
     """截断名称至指定显示宽度。"""
+    return truncate_to_width(s, max_width)
+
+
+def truncate_to_width(s, max_width):
+    """按终端显示宽度截断任意字符串（中文按 2 列计）。"""
     s = str(s)
+    if max_width <= 0:
+        return ''
     w = 0
     result = []
     for c in s:
-        cw = 2 if ord(c) > 127 else 1
-        if w + cw <= max_width:
-            w += cw
-            result.append(c)
-        else:
+        cw = char_width(c)
+        if w + cw > max_width:
             break
+        w += cw
+        result.append(c)
     return ''.join(result)
 
 
@@ -333,6 +489,24 @@ def split_name(name):
     return name[:mid], name[mid:]
 
 
+def fmt_open_price(open_val, prev_close_val, digits=2):
+    """格式化今开价，附带相对昨收的箭头指示。"""
+    price_str = fmt_num(open_val, digits=digits)
+    try:
+        o = float(open_val)
+        p = float(prev_close_val)
+        if o > p:
+            return price_str, '↑'
+        if o < p:
+            return price_str, '↓'
+        return price_str, '-'
+    except (TypeError, ValueError):
+        pass
+    return price_str, ' '
+
+
+# ── 名称 -> secid ───────────────────────────────────────────
+
 def search_secids(names, meta=None):
     """通过东方财富搜索 API 将股票名称转为 secid。
 
@@ -341,140 +515,135 @@ def search_secids(names, meta=None):
         meta: 可选 dict，用于回填 name/code/market 信息
 
     Returns:
-        secid 列表 (如 ['1.600519', '0.000001'])
+        secid 列表 (如 ['1.600519', '0.000001'])，顺序与 names 一致。
     """
-    cache = _load_secid_cache()
-    secids = []
-    need_save = False
-    for name in names:
-        # 1) 先查本地缓存
-        cached_secid = cache.get(name)
-        if cached_secid:
-            secids.append(cached_secid)
-            continue
+    cache = load_json_cache(SECID_CACHE_FILE, {})
+    if not isinstance(cache, dict):
+        cache = {}
 
-        # 2) 缓存未命中再请求网络
-        items = []
+    resolved = {}
+    items_by_name = {}
+    changed = False
+    for name in names:
+        if name in cache:
+            resolved[name] = cache[name]
+            continue
         try:
             url = (
                 "https://searchapi.eastmoney.com/api/suggest/get?"
                 f"input={urllib.parse.quote(name)}&type=14&count=5"
             )
-            data = fetch(url, timeout=10)
-            items = data.get('QuotationCodeTable', {}).get('Data', [])
-        except Exception as e:
-            # urllib 在某些环境会被服务端返回非行情数据，用 curl 兜底
-            try:
-                url = (
-                    "https://searchapi.eastmoney.com/api/suggest/get?"
-                    f"input={urllib.parse.quote(name)}&type=14&count=5"
-                )
-                text = _fetch_text_curl(url, timeout=10)
-                if text:
-                    data = json.loads(text)
-                    items = data.get('QuotationCodeTable', {}).get('Data', [])
-            except Exception:
-                print(f"[错误] 搜索 {name} 失败: {e}")
-                continue
-        try:
-            item = None
-            for it in items:
-                if it.get('Name') == name:
-                    item = it
-                    break
-            if item is None and items:
-                item = items[0]
+            data = fetch(url, timeout=10, retries=2)
+            table = data.get('QuotationCodeTable') if isinstance(data, dict) else None
+            if not table:
+                # urllib 被代理/接口识别时可能返回 200 但内容不对，改用 curl 再取一次
+                data = fetch_via_curl(url, timeout=10)
+                table = data.get('QuotationCodeTable') if isinstance(data, dict) else None
+            items = (table or {}).get('Data') or []
+            item = next((it for it in items if it.get('Name') == name), None)
             if item is None:
-                print(f"[警告] 未找到 {name}")
+                # 个别网络下 urllib 会拿到无关的 200 响应；用 curl 再确认一次
+                try:
+                    data = fetch_via_curl(url, timeout=10)
+                    table = data.get('QuotationCodeTable') if isinstance(data, dict) else None
+                    items = (table or {}).get('Data') or []
+                    item = next((it for it in items if it.get('Name') == name), None)
+                except Exception:
+                    item = None
+            if item is None:
+                log_message(f'security not matched exactly: {name}')
                 continue
             secid = item.get('QuoteID')
-            secids.append(secid)
+            if not secid:
+                continue
+            resolved[name] = secid
+            items_by_name[name] = item
             cache[name] = secid
-            need_save = True
-            if meta is not None:
-                meta[secid] = {
-                    'name': item.get('Name', name),
-                    'code': item.get('Code'),
-                    'market': '深A' if str(item.get('MktNum')) == '0' else '沪A',
-                }
+            changed = True
         except Exception as e:
-            print(f"[错误] 搜索 {name} 失败: {e}")
-    if need_save:
-        _save_secid_cache()
+            log_message(f'security search failed: {name}: {e}')
+
+    if changed:
+        save_json_cache(SECID_CACHE_FILE, cache)
+
+    secids = [resolved[name] for name in names if name in resolved]
+    if meta is not None:
+        for name, item in items_by_name.items():
+            secid = resolved.get(name)
+            if not secid:
+                continue
+            meta[secid] = {
+                'name': item.get('Name', name),
+                'code': item.get('Code'),
+                'market': '深A' if str(item.get('MktNum')) == '0' else '沪A',
+            }
     return secids
 
 
+# ── 实时行情 ────────────────────────────────────────────────
+
+_QUOTE_FIELDS = ','.join([
+    F_CODE, F_MARKET, F_NAME, F_PRICE, F_PCT_CHG, F_CHG,
+    F_VOL, F_AMT, F_TURNOVER, F_VOL_RATIO, F_HIGH, F_LOW,
+    F_OPEN, F_PREV_CLOSE, F_TOTAL_CAP, F_FLOAT_CAP, F_PE, F_PB,
+    F_LATEST_VOL,
+])
+
+
+def _row_secid(row):
+    return f"{row.get(F_MARKET, '0')}.{row.get(F_CODE, '')}"
+
+
 def fetch_quote_rows(secids):
-    """获取行情数据：主用东财 push2，失败自动降级到新浪。
+    """获取行情：主用东财 push2，失败或缺失时用新浪补齐。
 
     Returns:
-        list[dict]: 每只股票的行情字段，字段名见模块顶部常量
+        list[dict]: 按 secids 顺序返回，字段名见模块顶部常量。
     """
     if not secids:
         return []
 
-    # 1) 主数据源：东方财富
+    rows = []
     try:
-        fields = ','.join([
-            F_CODE, F_MARKET, F_NAME, F_PRICE, F_PCT_CHG, F_CHG,
-            F_VOL, F_AMT, F_TURNOVER, F_VOL_RATIO, F_HIGH, F_LOW,
-            F_OPEN, F_PREV_CLOSE, F_TOTAL_CAP, F_FLOAT_CAP, F_LATEST_VOL
-        ])
-        secid_str = ','.join(secids)
-        quote_url = (
+        url = (
             "https://push2.eastmoney.com/api/qt/ulist.np/get?"
-            f"fltt=2&invt=2&fields={fields}&secids={secid_str}"
+            f"fltt=2&invt=2&fields={_QUOTE_FIELDS}&secids={','.join(secids)}"
         )
-        qdata = fetch(quote_url, timeout=15, retries=2)
-        rows = qdata.get('data', {}).get('diff', [])
-        if rows:
-            return rows
+        data = fetch(url, timeout=15, retries=2)
+        diff = data.get('data', {}).get('diff') or []
+        if isinstance(diff, dict):
+            diff = list(diff.values())
+        rows = list(diff)
     except Exception as e:
-        print(f'[warn] EastMoney quote fetch failed: {e}')
+        log_message(f'EastMoney quote fetch failed: {e}')
 
-    # 2) 兜底数据源：新浪财经
-    try:
-        rows = fetch_quotes_sina(secids, retries=2)
-        if rows:
-            print(f'[info] switched to Sina fallback ({len(rows)}/{len(secids)} symbols)')
-            return rows
-    except Exception as e:
-        print(f'[warn] Sina quote fetch failed: {e}')
+    have = {_row_secid(r) for r in rows}
+    missing = [s for s in secids if s not in have]
+    if missing:
+        try:
+            sina_rows = fetch_quotes_sina(missing, retries=2)
+            if sina_rows:
+                rows.extend(sina_rows)
+                log_message(f'switched to Sina fallback ({len(sina_rows)}/{len(missing)} symbols)')
+        except Exception as e:
+            log_message(f'Sina quote fetch failed: {e}')
 
-    raise RuntimeError('所有行情数据源均不可用（东财、新浪）')
+    if not rows:
+        raise RuntimeError('所有行情数据源均不可用（东财、新浪）')
+
+    by_id = {_row_secid(r): r for r in rows}
+    ordered = [by_id[s] for s in secids if s in by_id]
+    extras = [r for r in rows if _row_secid(r) not in set(secids)]
+    return ordered + extras
 
 
-def fmt_open_price(open_val, prev_close_val, digits=2):
-    """格式化今开价，附带相对昨收的箭头指示。"""
-    price_str = fmt_num(open_val, digits=digits)
-    try:
-        o = float(open_val)
-        p = float(prev_close_val)
-        if o > p:
-            return price_str, '▲'
-        elif o < p:
-            return price_str, '▼'
-        else:
-            return price_str, '-'
-    except Exception:
-        pass
-    return price_str, ' '
-
+# ── 五档盘口 ────────────────────────────────────────────────
 
 def fetch_depth_data(secid, retries=1):
     """获取单只股票的五档买卖盘口数据。
 
-    Args:
-        secid: 东方财富 secid，如 '1.600519'
-        retries: 重试次数
-
     Returns:
-        dict 或 None（获取失败时）。
-        字段: name, code, price, prev_close, open, high, low,
-              volume, amount, turnover, change, pct_chg,
-              limit_up, limit_down,
-              asks: [(price, vol), ...] 卖1~卖5
-              bids: [(price, vol), ...] 买1~买5
+        dict 或 None（获取失败时）。字段见 README。
     """
     fields = (
         'f43,f44,f45,f46,f47,f48,f57,f58,f60,f169,f170,f8,'
@@ -482,13 +651,12 @@ def fetch_depth_data(secid, retries=1):
         'f39,f40,f37,f38,f35,f36,f33,f34,f31,f32,'
         'f51,f52'
     )
-    # Try main domain first, then numbered fallback servers
     urls = [
         f'https://push2.eastmoney.com/api/qt/stock/get?ut=fa5fd1943c7b386f172d5113dba1e33d&secid={secid}&fields={fields}',
         f'https://1.push2.eastmoney.com/api/qt/stock/get?ut=fa5fd1943c7b386f172d5113dba1e33d&secid={secid}&fields={fields}',
     ]
 
-    # Price-related fields that need /100 adjustment on numbered fallback servers
+    # 东财 stock/get 接口的价格相关字段统一放大 100 倍
     _price_fields = {
         'f43', 'f44', 'f45', 'f46', 'f60', 'f169', 'f170',
         'f19', 'f17', 'f15', 'f13', 'f11',
@@ -504,11 +672,8 @@ def fetch_depth_data(secid, retries=1):
 
     last_err = None
     for url_idx, url in enumerate(urls):
-        is_fallback = url_idx > 0
-        # For main domain, retry according to retries param;
-        # for fallback, just one shot per URL
-        max_tries = retries if not is_fallback else 1
-        for i in range(max_tries):
+        max_tries = retries if url_idx == 0 else 1
+        for i in range(max(1, max_tries)):
             try:
                 data = fetch(url, timeout=10, extra_headers=headers)
             except Exception as e:
@@ -525,18 +690,16 @@ def fetch_depth_data(secid, retries=1):
                 v = d.get(key, '')
                 try:
                     val = float(v) if v not in (None, '', '-') else default
-                    # 东方财富 stock/get 接口的价格相关字段统一放大 100 倍
                     if val is not None and key in _price_fields:
                         val = val / 100.0
                     return val
-                except (ValueError, TypeError):
+                except (TypeError, ValueError):
                     return default
 
             def _int_from_float(key, default=None):
                 v = _float(key, default)
                 return int(v) if v is not None else default
 
-            # 五档 (price, volume) 对 —— 注意字段编号是递减的
             asks = [
                 (_float('f39'), _int_from_float('f40')),
                 (_float('f37'), _int_from_float('f38')),
@@ -570,19 +733,18 @@ def fetch_depth_data(secid, retries=1):
                 'asks': asks,
                 'bids': bids,
             }
+
     if last_err:
-        print(f'[warn] EastMoney depth fetch failed: {last_err}, trying Sina fallback')
+        log_message(f'EastMoney depth fetch failed: {last_err}, trying Sina fallback')
 
     # ── 兜底：新浪财经 ──
     try:
         sina_code = secid_to_sina_code(secid)
         url = f'https://hq.sinajs.cn/list={sina_code}'
-        req = urllib.request.Request(url, headers={
-            'Referer': 'https://finance.sina.com.cn/',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        with _urlopen(req, timeout=15) as resp:
-            text = resp.read().decode('gbk', errors='replace')
+        text = fetch_text(
+            url, timeout=15, encoding='gbk',
+            extra_headers={'Referer': 'https://finance.sina.com.cn/'}
+        )
         m = re.search(r'var hq_str_' + re.escape(sina_code) + r'="([^"]*)";', text)
         if m:
             content = m.group(1)
@@ -600,23 +762,22 @@ def fetch_depth_data(secid, retries=1):
                     amount = _safe_float(parts[9])
                     change = round(price - prev_close, 3) if price is not None and prev_close is not None else None
                     pct_chg = round(change / prev_close * 100, 2) if change is not None and prev_close else None
-                    # 根据板块计算涨停跌停幅度
                     limit_ratio = _limit_ratio_for_code(code, name)
                     limit_up = round(prev_close * (1 + limit_ratio), 2) if prev_close is not None else None
                     limit_down = round(prev_close * (1 - limit_ratio), 2) if prev_close is not None else None
                     bids = [
-                        (_safe_float(parts[11]), _safe_int(parts[10])),
-                        (_safe_float(parts[13]), _safe_int(parts[12])),
-                        (_safe_float(parts[15]), _safe_int(parts[14])),
-                        (_safe_float(parts[17]), _safe_int(parts[16])),
-                        (_safe_float(parts[19]), _safe_int(parts[18])),
+                        (_safe_float(parts[11]), _safe_lot(parts[10])),
+                        (_safe_float(parts[13]), _safe_lot(parts[12])),
+                        (_safe_float(parts[15]), _safe_lot(parts[14])),
+                        (_safe_float(parts[17]), _safe_lot(parts[16])),
+                        (_safe_float(parts[19]), _safe_lot(parts[18])),
                     ]
                     asks = [
-                        (_safe_float(parts[21]), _safe_int(parts[20])),
-                        (_safe_float(parts[23]), _safe_int(parts[22])),
-                        (_safe_float(parts[25]), _safe_int(parts[24])),
-                        (_safe_float(parts[27]), _safe_int(parts[26])),
-                        (_safe_float(parts[29]), _safe_int(parts[28])),
+                        (_safe_float(parts[21]), _safe_lot(parts[20])),
+                        (_safe_float(parts[23]), _safe_lot(parts[22])),
+                        (_safe_float(parts[25]), _safe_lot(parts[24])),
+                        (_safe_float(parts[27]), _safe_lot(parts[26])),
+                        (_safe_float(parts[29]), _safe_lot(parts[28])),
                     ]
                     return {
                         'name': name,
@@ -637,7 +798,7 @@ def fetch_depth_data(secid, retries=1):
                         'bids': bids,
                     }
     except Exception as e:
-        print(f'[warn] Sina depth fallback failed: {e}')
+        log_message(f'Sina depth fallback failed: {e}')
 
     return None
 
@@ -649,9 +810,9 @@ def _safe_float(v):
         return None
 
 
-def _safe_int(v):
+def _safe_lot(v):
     try:
-        return int(v)
+        return int(float(v)) // 100
     except (TypeError, ValueError):
         return None
 
@@ -669,46 +830,45 @@ def _limit_ratio_for_code(code, name=''):
     return 0.10
 
 
+# ── 终端输入（macOS/Linux raw mode + Windows msvcrt）─────────
+
 _raw_fd = None
 _raw_old = None
 
 
+def is_tty():
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:
+        return False
+
+
 def enter_raw_mode():
-    """进入一次性 raw 模式，持续到 restore_terminal()。
-
-    macOS/Linux: 把终端切换为 raw 模式，关闭行缓冲与回显（ECHO/ICANON/ISIG）。
-    这样方向键/功能键的转义序列能被完整逐字节读取，也不会被终端回显成
-    诸如 ^[[B 之类的文本。交互期间只调用一次，避免反复切换导致按键丢失。
-
-    注意：仅关闭“输入侧”的标志（回显/行缓冲/信号），保留 OFLAG 里的
-    OPOST/ONLCR，使 print() 输出的 \\n 仍被终端转换为 \\r\\n，
-    否则整屏会因只换行不回车而呈阶梯状乱套。
-    """
+    """进入一次性 raw 模式，持续到 restore_terminal()。"""
     global _raw_fd, _raw_old
     if sys.platform == 'win32':
-        return
+        return True
     try:
         import termios
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
-        _raw_old = old
         new = list(old)
-        # 注意：本 Python 的 termios 模块不导出 IFLAG/OFLAG/LFLAG/CC 下标常量，
-        # 只能按 tcgetattr 返回顺序用数字下标：0=iflag,1=oflag,3=lflag,6=cc。
-        # 输入侧：关闭回显、行缓冲、信号，且不做 \r->\n 转换/软件流控。
+        # 0=iflag, 1=oflag, 3=lflag, 6=cc
         new[0] &= ~(termios.BRKINT | termios.ICRNL
                     | termios.INPCK | termios.ISTRIP | termios.IXON)
         new[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
         new[6][termios.VMIN] = 1
         new[6][termios.VTIME] = 0
-        # 输出侧保留 OPOST/ONLCR：print() 的 \n 必须转成 \r\n，
-        # 否则终端只换行不回车，整屏会呈阶梯状乱套。
+        # 保留 OPOST/ONLCR，print 的 \n 仍会转换为 \r\n
         new[1] |= termios.OPOST | termios.ONLCR
         termios.tcsetattr(fd, termios.TCSAFLUSH, new)
         _raw_fd = fd
+        _raw_old = old
+        return True
     except Exception:
         _raw_fd = None
         _raw_old = None
+        return False
 
 
 def restore_terminal():
@@ -726,20 +886,33 @@ def restore_terminal():
         _raw_old = None
 
 
+def _read_escape_tail(fd, wait=0.06):
+    """读取 ESC 之后的转义序列尾巴（最多 5 字节）。"""
+    import select
+    out = ''
+    for _ in range(5):
+        r, _, _ = select.select([fd], [], [], wait)
+        if not r:
+            break
+        c = os.read(fd, 1)
+        if not c:
+            break
+        ch = c.decode('utf-8', errors='replace')
+        if ch == '\x1b':
+            break
+        out += ch
+        if out in ('[A', '[B', '[C', '[D', '[20~',
+                   'OA', 'OB', 'OC', 'OD'):
+            break
+    return out
+
+
 def get_key(timeout=0.1):
     """跨平台非阻塞读取单个按键。
 
-    在 Windows 上使用 msvcrt；在 Unix 上使用 select+os.read。
-    Unix 下调用前需先 enter_raw_mode() 进入 raw 模式（交互期间保持），
-    本函数不再反复切换终端模式，避免回显与转义序列被拆开误读。
-
-    Args:
-        timeout: 轮询超时（秒），仅在 Unix select 模式下生效
-
     Returns:
-        str 或 None:
-            'UP', 'DOWN', 'LEFT', 'RIGHT', 'ENTER', 'ESC', 'F9', 'R', 'r',
-            或 None（超时无输入）
+        'UP' / 'DOWN' / 'LEFT' / 'RIGHT' / 'ENTER' / 'ESC' / 'F9' /
+        'CTRL_C' / 单个字符 / None（超时无输入）
     """
     if sys.platform == 'win32':
         import msvcrt
@@ -748,91 +921,71 @@ def get_key(timeout=0.1):
         ch = msvcrt.getch()
         if ch in (b'\xe0', b'\x00'):
             ch2 = msvcrt.getch()
-            _arrow = {b'H': 'UP', b'P': 'DOWN', b'K': 'LEFT', b'M': 'RIGHT'}
-            return _arrow.get(ch2)
+            _special = {
+                b'H': 'UP', b'P': 'DOWN', b'K': 'LEFT', b'M': 'RIGHT',
+                b'C': 'F9', b'S': 'DELETE',
+            }
+            return _special.get(ch2)
         if ch == b'\r':
             return 'ENTER'
         if ch == b'\x1b':
             return 'ESC'
+        if ch == b'\x03':
+            return 'CTRL_C'
         try:
-            decoded = ch.decode('utf-8', errors='replace')
+            decoded = ch.decode('ascii')
             return decoded if len(decoded) == 1 else None
         except Exception:
             return None
-    else:
-        # Unix: 已由 enter_raw_mode() 保持 raw，直接读取字节
-        import select
 
-        def _read_escape_tail(fd, wait=0.1):
-            """读取 ESC 之后的转义序列尾巴（最多 5 字节）。
-
-            读到一条完整可识别的序列（方向键 [A/B/C/D 或功能键 [20~）就停，
-            或遇到下一个 ESC 就停，避免连发的多条转义序列被混在一起误读。
-            """
-            out = ''
-            for _ in range(5):
-                r, _, _ = select.select([fd], [], [], wait)
-                if not r:
-                    break
-                c = os.read(fd, 1)
-                if not c:
-                    break
-                ch = c.decode('utf-8', errors='replace')
-                if ch == '\x1b':
-                    # 下一个转义序列开始，说明当前 ESC 已是独立按键
-                    break
-                out += ch
-                if out in ('[A', '[B', '[C', '[D', '[20~',
-                           'OA', 'OB', 'OC', 'OD'):
-                    break
-            return out
-
+    # Unix：已由 enter_raw_mode() 保持 raw，直接读取字节
+    import select
+    try:
         fd = sys.stdin.fileno()
-        r, _, _ = select.select([sys.stdin], [], [], timeout)
-        if not r:
-            return None
-        ch = os.read(fd, 1)
-        if not ch:
-            return None
-        ch = ch.decode('utf-8', errors='replace')
-        if ch == '\x1b':
-            # 给终端一点时间来发送完整转义序列；单独一个 ESC 即为 Esc 键。
-            seq = _read_escape_tail(fd)
-            if seq[:1] in ('[', 'O'):
-                body = seq[1:]
-                _arrow = {'A': 'UP', 'B': 'DOWN', 'C': 'RIGHT', 'D': 'LEFT'}
-                if body in _arrow:
-                    return _arrow[body]
-                # 功能键：F9 常见序列为 "20~"
-                if body == '20~':
-                    return 'F9'
-            return 'ESC'
-        if ch in ('\r', '\n'):
-            return 'ENTER'
-        if ch == '\x03':  # raw 模式下 Ctrl+C 不再触发 SIGINT，作为退出信号返回
-            return 'CTRL_C'
-        return ch if len(ch) == 1 else None
+    except Exception:
+        return None
+    r, _, _ = select.select([fd], [], [], timeout)
+    if not r:
+        return None
+    ch = os.read(fd, 1)
+    if not ch:
+        return None
+    ch = ch.decode('utf-8', errors='replace')
+    if ch == '\x1b':
+        seq = _read_escape_tail(fd)
+        if seq[:1] in ('[', 'O'):
+            body = seq[1:]
+            _arrow = {'A': 'UP', 'B': 'DOWN', 'C': 'RIGHT', 'D': 'LEFT'}
+            if body in _arrow:
+                return _arrow[body]
+            if body == '20~':
+                return 'F9'
+        return 'ESC'
+    if ch in ('\r', '\n'):
+        return 'ENTER'
+    if ch == '\x03':
+        return 'CTRL_C'
+    return ch if len(ch) == 1 else None
+
+
+# ── 三市成交总额 ────────────────────────────────────────────
+
+_market_total_cache = None
+_market_history_refresh_date = None
+_market_history_ready = False
+_market_total_next_retry = 0.0
+_market_lock = threading.Lock()
 
 
 def load_market_total_cache():
     """加载3市场成交额历史缓存。"""
-    try:
-        with open(MARKET_TOTAL_CACHE_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    data = load_json_cache(MARKET_TOTAL_CACHE_FILE, {})
+    return data if isinstance(data, dict) else {}
 
 
 def save_market_total_cache(cache):
-    """保存3市场成交额历史缓存。"""
-    try:
-        with open(MARKET_TOTAL_CACHE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(cache, f, ensure_ascii=False)
-    except Exception:
-        pass
-
-
-_market_total_cache = None
+    """原子保存3市场成交额历史缓存。"""
+    save_json_cache(MARKET_TOTAL_CACHE_FILE, cache)
 
 
 def get_market_total_cache():
@@ -843,150 +996,8 @@ def get_market_total_cache():
     return _market_total_cache
 
 
-# ── 半年涨跌幅缓存 ──────────────────────────────────────────
-_HY_CACHE_FILE = os.path.join(BASE_DIR, '.hy_pct_cache.json')
-_HY_CACHE = None
-_hy_update_thread = None
-_hy_update_result = None
-
-
-def load_hy_cache():
-    """加载半年涨跌幅缓存。"""
-    global _HY_CACHE
-    if _HY_CACHE is None:
-        try:
-            with open(_HY_CACHE_FILE, 'r', encoding='utf-8') as f:
-                _HY_CACHE = json.load(f)
-        except Exception:
-            _HY_CACHE = {}
-    return _HY_CACHE
-
-
-def save_hy_cache():
-    """保存半年涨跌幅缓存。"""
-    try:
-        with open(_HY_CACHE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(_HY_CACHE or {}, f, ensure_ascii=False, indent=4)
-    except Exception:
-        pass
-
-
-def get_hy_cache():
-    """获取全局半年涨跌幅缓存对象。"""
-    global _HY_CACHE
-    if _HY_CACHE is None:
-        _HY_CACHE = load_hy_cache()
-    return _HY_CACHE
-
-
-def fetch_half_year_pct(secid):
-    """获取单只股票相对半年前的涨跌幅（%）。
-
-    使用东财日线接口，取最近一根 K 线往前约 6 个月的收盘价作对比。
-    """
-    url = (
-        "https://push2his.eastmoney.com/api/qt/stock/kline/get?"
-        f"secid={secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&"
-        "fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&"
-        "klt=101&fqt=0&end=20500101&lmt=200"
-    )
-    try:
-        data = fetch(url, timeout=15,
-                     extra_headers={'Referer': 'https://quote.eastmoney.com/'})
-        klines = data.get('data', {}).get('klines', [])
-        if not klines:
-            return None
-        latest = klines[-1].split(',')
-        if len(latest) < 3:
-            return None
-        latest_date = datetime.datetime.strptime(latest[0], '%Y-%m-%d').date()
-        target_date = latest_date - datetime.timedelta(days=180)
-        target_price = None
-        for k in klines:
-            parts = k.split(',')
-            if len(parts) < 3:
-                continue
-            d = datetime.datetime.strptime(parts[0], '%Y-%m-%d').date()
-            if d >= target_date:
-                target_price = float(parts[2])
-                break
-        current_price = float(latest[2])
-        if target_price is None or target_price == 0:
-            return None
-        return round((current_price - target_price) / target_price * 100, 2)
-    except Exception:
-        return None
-
-
-def _hy_worker(secids):
-    """后台线程：并发抓取半年涨跌幅。"""
-    result = {}
-    today = datetime.date.today().strftime('%Y-%m-%d')
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        future_to_secid = {ex.submit(fetch_half_year_pct, s): s for s in secids}
-        for future in concurrent.futures.as_completed(future_to_secid):
-            secid = future_to_secid[future]
-            try:
-                pct = future.result()
-                if pct is not None:
-                    result[secid] = {'pct': pct, 'date': today}
-            except Exception:
-                pass
-    return result
-
-
-def start_half_year_update(secids):
-    """如尚未在更新且存在待更新 secid，则在后台启动半年涨跌抓取。"""
-    global _hy_update_thread, _hy_update_result
-    if _hy_update_thread is not None and _hy_update_thread.is_alive():
-        return
-    today = datetime.date.today().strftime('%Y-%m-%d')
-    need = []
-    cache = get_hy_cache()
-    for secid in secids:
-        cached = cache.get(secid)
-        if cached is None or cached.get('date') != today:
-            need.append(secid)
-    if not need:
-        return
-    _hy_update_result = None
-    _hy_update_thread = threading.Thread(target=lambda: _set_hy_result(need),
-                                         daemon=True)
-    _hy_update_thread.start()
-
-
-def _set_hy_result(secids):
-    """在线程中执行抓取并保存结果。"""
-    global _hy_update_result
-    _hy_update_result = _hy_worker(secids)
-
-
-def complete_half_year_update():
-    """将已完成的半年涨跌后台结果合并进缓存并落盘。"""
-    global _hy_update_thread, _hy_update_result
-    if _hy_update_thread is None:
-        return
-    if not _hy_update_thread.is_alive():
-        if _hy_update_result is not None:
-            cache = get_hy_cache()
-            cache.update(_hy_update_result)
-            save_hy_cache()
-        _hy_update_thread = None
-        _hy_update_result = None
-
-
-def apply_half_year_pct(rows):
-    """为行情行附加 'hyPct' 字段（来自缓存），无缓存则为 None。"""
-    cache = get_hy_cache()
-    for r in rows:
-        secid = f"{r.get(F_MARKET, '0')}.{r.get(F_CODE, '')}"
-        cached = cache.get(secid)
-        r['hyPct'] = cached.get('pct') if cached else None
-
-
 def fetch_index_kline_amounts(secid, days=20):
     """获取指数日线成交额历史，返回 [(date, amount), ...]。"""
-    import datetime
     today = datetime.date.today()
     beg = (today - datetime.timedelta(days=days + 5)).strftime('%Y%m%d')
     end = (today + datetime.timedelta(days=1)).strftime('%Y%m%d')
@@ -1007,21 +1018,67 @@ def fetch_index_kline_amounts(secid, days=20):
                 result.append((parts[0], float(parts[6])))
         return result
     except Exception as e:
-        print(f'[warn] market total kline fetch failed for {secid}: {e}')
+        log_message(f'market total kline fetch failed for {secid}: {e}')
         return []
 
 
+def warm_market_total_cache():
+    """每天刷新历史成交额；由后台线程调用，不在绘制时访问网络。"""
+    global _market_history_refresh_date, _market_history_ready, _market_total_next_retry
+    with _market_lock:
+        today_str = datetime.date.today().strftime('%Y-%m-%d')
+        if _market_history_refresh_date == today_str or time.time() < _market_total_next_retry:
+            return False
+        _market_history_refresh_date = today_str
+        cache = get_market_total_cache()
+        # 周末不需要刷新历史成交额；缓存够用就直接标记可用
+        if datetime.date.today().weekday() >= 5:
+            cached_days = min(
+                len(cache.get(secid, {})) for secid in MARKET_TOTAL_SECIDS.values()
+            )
+            if cached_days >= 6:
+                _market_history_ready = True
+                return False
+        changed = False
+        fresh_count = 0
+        for secid in MARKET_TOTAL_SECIDS.values():
+            dates = cache.setdefault(secid, {})
+            items = fetch_index_kline_amounts(secid, 20)
+            if items:
+                fresh_count += 1
+            for date_str, amount in items:
+                dates[date_str] = amount
+                changed = True
+        if changed:
+            save_market_total_cache(cache)
+        # 即使今天拉取失败，只要缓存里三个市场都有足够的历史交易日，
+        # 仍可继续显示三市总额，避免网络波动导致整块数据消失。
+        cached_days = min(
+            len(cache.get(secid, {})) for secid in MARKET_TOTAL_SECIDS.values()
+        )
+        _market_history_ready = (
+            fresh_count == len(MARKET_TOTAL_SECIDS) or cached_days >= 6
+        )
+        if fresh_count == len(MARKET_TOTAL_SECIDS):
+            _market_total_next_retry = 0.0
+        elif _market_history_ready:
+            # 缓存够用，但今天没刷新成功：半小时后再试，避免频繁请求
+            _market_history_refresh_date = None
+            _market_total_next_retry = time.time() + 1800
+        else:
+            _market_history_refresh_date = None
+            _market_total_next_retry = time.time() + 60
+        return changed
+
+
 def _trading_elapsed_minutes(time_str):
-    """计算 A 股从开盘到指定时刻的累计交易分钟数（09:30-11:30, 13:00-15:00，共240分钟）。"""
-    import datetime
+    """计算 A 股从开盘到指定时刻的累计交易分钟数（09:30-11:30, 13:00-15:00）。"""
     t = datetime.datetime.strptime(time_str, '%H:%M')
     minutes = t.hour * 60 + t.minute
-
-    am_start = 9 * 60 + 30   # 570
-    am_end = 11 * 60 + 30    # 690
-    pm_start = 13 * 60       # 780
-    pm_end = 15 * 60         # 900
-
+    am_start = 9 * 60 + 30
+    am_end = 11 * 60 + 30
+    pm_start = 13 * 60
+    pm_end = 15 * 60
     if minutes <= am_start:
         return 0
     if minutes <= am_end:
@@ -1030,62 +1087,51 @@ def _trading_elapsed_minutes(time_str):
         return am_end - am_start
     if minutes <= pm_end:
         return (am_end - am_start) + (minutes - pm_start)
-    return (am_end - am_start) + (pm_end - pm_start)  # 240
+    return (am_end - am_start) + (pm_end - pm_start)
 
 
 def get_market_total_amounts(index_rows):
     """计算沪深京三市场今日成交总额及量比。
 
-    量比 = (今日累计成交额 / 已交易分钟数) / (过去5日日均成交额 / 240)
-
     Returns:
         dict: {'total_yi': 总额(亿), 'ratio': 量比} 或 None（数据不足）。
     """
-    import datetime
     cache = get_market_total_cache()
-    today_str = datetime.date.today().strftime('%Y-%m-%d')
+    today = datetime.date.today()
+    if not _market_history_ready or today.weekday() >= 5:
+        return None
+    today_str = today.strftime('%Y-%m-%d')
 
-    # 从已有指数行情中提取今日成交额
     today_amounts = {}
     for r in index_rows:
         secid = f"{r.get(F_MARKET, '0')}.{r.get(F_CODE, '')}"
         if secid in MARKET_TOTAL_SECIDS.values():
             try:
                 today_amounts[secid] = float(r.get(F_AMT, 0) or 0)
-            except Exception:
+            except (TypeError, ValueError):
                 today_amounts[secid] = 0.0
 
     if len(today_amounts) != 3 or any(v <= 0 for v in today_amounts.values()):
         return None
 
-    # 确保缓存中至少包含过去5个交易日
-    need_save = False
-    for secid in MARKET_TOTAL_SECIDS.values():
-        if secid not in cache:
-            cache[secid] = {}
-        before_today = [d for d in cache[secid] if d < today_str]
-        if len(before_today) < 5:
-            for date_str, amount in fetch_index_kline_amounts(secid, 20):
-                cache[secid][date_str] = amount
-            need_save = True
+    date_sets = [
+        {d for d in cache.get(secid, {}) if d < today_str}
+        for secid in MARKET_TOTAL_SECIDS.values()
+    ]
+    if not date_sets:
+        return None
+    dates = sorted(set.intersection(*date_sets), reverse=True)[:5]
+    if len(dates) < 5:
+        return None
 
-    if need_save:
-        save_market_total_cache(cache)
-
-    # 计算过去5个交易日三市场合计日均成交额
-    total_by_day = [0.0] * 5
-    for secid in MARKET_TOTAL_SECIDS.values():
-        dates = sorted([d for d in cache[secid] if d < today_str], reverse=True)[:5]
-        if len(dates) < 5:
-            return None
-        for i, d in enumerate(dates):
-            total_by_day[i] += cache[secid][d]
-
+    total_by_day = [
+        sum(cache[secid][d] for secid in MARKET_TOTAL_SECIDS.values())
+        for d in dates
+    ]
     avg = sum(total_by_day) / len(total_by_day)
     today_total = sum(today_amounts.values())
 
-    current_time = datetime.datetime.now().strftime('%H:%M')
-    elapsed = _trading_elapsed_minutes(current_time)
+    elapsed = _trading_elapsed_minutes(datetime.datetime.now().strftime('%H:%M'))
     if elapsed <= 0:
         return None
 
@@ -1097,7 +1143,7 @@ def get_market_total_amounts(index_rows):
     }
 
 
-def print_market_total(info, table_width=113):
+def print_market_total(info, table_width=114):
     """在指数方块下方打印三市成交总额与量比。"""
     if not info or info.get('total_yi') is None or info.get('ratio') is None:
         return
@@ -1105,14 +1151,12 @@ def print_market_total(info, table_width=113):
     print(pad_right(line, table_width))
 
 
-def print_indices(rows, table_width=113):
-    """以方块形式打印指数行情。"""
+def print_indices(rows, table_width=114):
+    """以方块形式打印指数行情（--once 兼容接口）。"""
     print('-' * table_width)
-
     per_row = 5
-    sep = ' │ '
+    sep = ' | '
     sep_w = display_width(sep)
-
     boxes = []
     min_box_w = 0
     for r in rows:
@@ -1127,22 +1171,17 @@ def print_indices(rows, table_width=113):
             display_width(name) + display_width(price),
             display_width(right2),
         )
-
     box_w = (table_width - (per_row - 1) * sep_w) // per_row
     if box_w < min_box_w:
         box_w = min_box_w
 
     def fmt_top(name, price):
         pad = box_w - display_width(name) - display_width(price)
-        if pad < 0:
-            pad = 0
-        return name + ' ' * pad + price
+        return name + ' ' * max(0, pad) + price
 
     def fmt_bottom(right2):
         pad = box_w - display_width(right2)
-        if pad < 0:
-            pad = 0
-        return ' ' * pad + right2
+        return ' ' * max(0, pad) + right2
 
     for i in range(0, len(boxes), per_row):
         parts1 = []
@@ -1155,11 +1194,373 @@ def print_indices(rows, table_width=113):
             parts2.append(fmt_bottom(right2))
         line1 = sep.join(parts1)
         line2 = sep.join(parts2)
-        pad = table_width - display_width(line1)
-        if pad > 0:
-            line1 += ' ' * pad
-        pad = table_width - display_width(line2)
-        if pad > 0:
-            line2 += ' ' * pad
+        line1 += ' ' * max(0, table_width - display_width(line1))
+        line2 += ' ' * max(0, table_width - display_width(line2))
         print(line1)
         print(line2)
+
+
+# ── 日线数据：东财失败时用新浪兜底 ─────────────────────────
+
+def _sina_kline_symbol(secid):
+    """新浪日线代码：北交所也要用 bj 前缀。"""
+    return secid_to_sina_code(secid).replace('s_', '', 1)
+
+
+def fetch_sina_daily_klines(secid, limit=300):
+    """新浪日线兜底，返回 [(date, close), ...]；失败返回 []。"""
+    symbol = _sina_kline_symbol(secid)
+    url = (
+        "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        f"CN_MarketData.getKLineData?symbol={symbol}&scale=240&ma=no&datalen={limit}"
+    )
+    try:
+        data = fetch(url, timeout=15,
+                     extra_headers={'Referer': 'https://finance.sina.com.cn/'})
+        if isinstance(data, dict):
+            data = data.get('result', {}).get('data') or []
+        result = []
+        for item in data or []:
+            if not isinstance(item, dict):
+                continue
+            day = item.get('day')
+            close = item.get('close')
+            if day and close not in (None, ''):
+                result.append((str(day), float(close)))
+        return result
+    except Exception as e:
+        log_message(f'Sina kline fallback failed for {secid}: {e}')
+        return []
+
+
+def _fetch_daily_klines(secid, limit=300):
+    """返回 [(date, close), ...]：优先东财 push2his，失败自动用新浪。"""
+    url = (
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get?"
+        f"secid={secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&"
+        "fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&"
+        f"klt=101&fqt=0&end=20500101&lmt={limit}"
+    )
+    try:
+        data = fetch(url, timeout=15,
+                     extra_headers={'Referer': 'https://quote.eastmoney.com/'})
+        result = []
+        for k in data.get('data', {}).get('klines', []):
+            parts = k.split(',')
+            if len(parts) >= 3:
+                result.append((parts[0], float(parts[2])))
+        if result:
+            return result
+    except Exception as e:
+        log_message(f'EastMoney kline fetch failed for {secid}: {e}')
+    return fetch_sina_daily_klines(secid, limit)
+
+
+# ── 半年涨跌幅（--hy on） ───────────────────────────────────
+
+_hy_cache = None
+_hy_lock = threading.Lock()
+_hy_thread = None
+_hy_result = None
+
+
+def load_hy_cache():
+    global _hy_cache
+    if _hy_cache is None:
+        data = load_json_cache(HY_CACHE_FILE, {})
+        _hy_cache = data if isinstance(data, dict) else {}
+    return _hy_cache
+
+
+def save_hy_cache():
+    save_json_cache(HY_CACHE_FILE, get_hy_cache())
+
+
+def get_hy_cache():
+    return load_hy_cache()
+
+
+def _minus_months(d, months):
+    month = d.month - months
+    year = d.year + (month - 1) // 12
+    month = (month - 1) % 12 + 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return datetime.date(year, month, day)
+
+
+def fetch_half_year_pct(secid):
+    """获取单只股票相对半年前的涨跌幅（%）。"""
+    try:
+        klines = _fetch_daily_klines(secid, limit=200)
+        if not klines:
+            return None
+        latest_date_str, current_price = klines[-1]
+        latest_date = datetime.datetime.strptime(latest_date_str, '%Y-%m-%d').date()
+        target_date = _minus_months(latest_date, 6)
+        target_price = None
+        for date_str, close in klines:
+            try:
+                d = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+            except ValueError:
+                continue
+            if d >= target_date:
+                target_price = close
+                break
+        if target_price is None or target_price == 0:
+            return None
+        return round((current_price - target_price) / target_price * 100, 2)
+    except Exception:
+        return None
+
+
+def _hy_worker(secids):
+    result = {}
+    today = datetime.date.today().strftime('%Y-%m-%d')
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        future_to_secid = {ex.submit(fetch_half_year_pct, s): s for s in secids}
+        for future in concurrent.futures.as_completed(future_to_secid):
+            secid = future_to_secid[future]
+            try:
+                pct = future.result()
+                if pct is not None:
+                    result[secid] = {'pct': pct, 'date': today}
+            except Exception:
+                pass
+    return result
+
+
+def start_half_year_update(secids):
+    """如尚未在更新且存在待更新 secid，则在后台启动半年涨跌抓取。"""
+    global _hy_thread, _hy_result
+    with _hy_lock:
+        if _hy_thread is not None and _hy_thread.is_alive():
+            return False
+        today = datetime.date.today().strftime('%Y-%m-%d')
+        cache = get_hy_cache()
+        need = []
+        for secid in secids:
+            cached = cache.get(secid)
+            if not isinstance(cached, dict) or cached.get('date') != today:
+                need.append(secid)
+        if not need:
+            return False
+        _hy_result = None
+
+        def run():
+            global _hy_result
+            _hy_result = _hy_worker(need)
+
+        _hy_thread = threading.Thread(target=run, daemon=True)
+        _hy_thread.start()
+        return True
+
+
+def complete_half_year_update():
+    """将已完成的半年涨跌后台结果合并进缓存并落盘。"""
+    global _hy_thread, _hy_result
+    with _hy_lock:
+        if _hy_thread is None or _hy_thread.is_alive():
+            return False
+        if _hy_result is not None:
+            cache = get_hy_cache()
+            cache.update(_hy_result)
+            save_hy_cache()
+        _hy_thread = None
+        _hy_result = None
+        return True
+
+
+def apply_half_year_pct(rows):
+    """为行情行附加 'hyPct' 字段（来自缓存），无缓存则为 None。"""
+    cache = get_hy_cache()
+    for r in rows:
+        secid = _row_secid(r)
+        cached = cache.get(secid)
+        r['hyPct'] = cached.get('pct') if isinstance(cached, dict) else None
+
+
+# ── 日均线 / PE PB（盘口详情用） ─────────────────────────────
+
+_ma_cache = None
+_ma_lock = threading.Lock()
+_ma_thread = None
+_ma_result = None
+
+_pepb_cache = None
+_pepb_lock = threading.Lock()
+_pepb_thread = None
+_pepb_result = None
+
+
+def _get_ma_cache():
+    global _ma_cache
+    if _ma_cache is None:
+        data = load_json_cache(MA_CACHE_FILE, {})
+        _ma_cache = data if isinstance(data, dict) else {}
+    return _ma_cache
+
+
+def fetch_daily_closes(secid, limit=300):
+    """获取日线收盘价序列（f53=收盘），东财失败时用新浪兜底。"""
+    return [close for _date, close in _fetch_daily_klines(secid, limit)]
+
+
+def _compute_mas(closes):
+    entry = {'date': datetime.date.today().strftime('%Y-%m-%d')}
+    for period in (10, 20, 30, 120, 250):
+        if len(closes) >= period:
+            entry[f'ma{period}'] = round(sum(closes[-period:]) / period, 2)
+    return entry
+
+
+def _ma_worker(secids):
+    result = {}
+    for secid in secids:
+        closes = fetch_daily_closes(secid)
+        if len(closes) >= 10:
+            result[secid] = _compute_mas(closes)
+        else:
+            # 记下当天已尝试，避免每次重绘都重复请求
+            result[secid] = {'date': datetime.date.today().strftime('%Y-%m-%d')}
+    return result
+
+
+def start_ma_update(secids):
+    global _ma_thread, _ma_result
+    with _ma_lock:
+        if _ma_thread is not None and _ma_thread.is_alive():
+            return False
+        today = datetime.date.today().strftime('%Y-%m-%d')
+        need = []
+        for secid in secids:
+            cached = _get_ma_cache().get(secid)
+            if not isinstance(cached, dict) or cached.get('date') != today:
+                need.append(secid)
+        if not need:
+            return False
+        _ma_result = None
+
+        def run():
+            global _ma_result
+            _ma_result = _ma_worker(need)
+
+        _ma_thread = threading.Thread(target=run, daemon=True)
+        _ma_thread.start()
+        return True
+
+
+def complete_ma_update():
+    global _ma_thread, _ma_result
+    with _ma_lock:
+        if _ma_thread is None or _ma_thread.is_alive():
+            return False
+        if _ma_result:
+            cache = _get_ma_cache()
+            cache.update(_ma_result)
+            save_json_cache(MA_CACHE_FILE, cache)
+        _ma_thread = None
+        _ma_result = None
+        return True
+
+
+def get_daily_mas(secid):
+    """只读当天缓存；缺失时启动后台补齐并返回 None。"""
+    today = datetime.date.today().strftime('%Y-%m-%d')
+    cached = _get_ma_cache().get(secid)
+    if isinstance(cached, dict) and cached.get('date') == today:
+        if any(cached.get(f'ma{p}') is not None for p in (10, 20, 30, 120, 250)):
+            return cached
+        return None
+    start_ma_update([secid])
+    return None
+
+
+def _get_pepb_cache():
+    global _pepb_cache
+    if _pepb_cache is None:
+        data = load_json_cache(PEPB_CACHE_FILE, {})
+        _pepb_cache = data if isinstance(data, dict) else {}
+    return _pepb_cache
+
+
+def fetch_pepb_data(secid):
+    url = (
+        "https://push2.eastmoney.com/api/qt/ulist.np/get?"
+        f"fltt=2&invt=2&fields=f9,f23&secids={secid}"
+    )
+    try:
+        data = fetch(url, timeout=15,
+                     extra_headers={'Referer': 'https://quote.eastmoney.com/'})
+        diff = data.get('data', {}).get('diff') or []
+        if isinstance(diff, dict):
+            diff = list(diff.values())
+        if diff:
+            row = diff[0]
+            pe, pb = row.get('f9'), row.get('f23')
+            if pe not in (None, '-', '') and pb not in (None, '-', ''):
+                return {'pe': round(float(pe), 2), 'pb': round(float(pb), 2)}
+    except Exception:
+        pass
+    return None
+
+
+def _pepb_worker(secids):
+    result = {}
+    for secid in secids:
+        entry = fetch_pepb_data(secid)
+        # 失败也写入当天占位，避免每次重绘都重复请求
+        result[secid] = entry if entry is not None else {'pe': None, 'pb': None}
+        time.sleep(0.3)  # 错时请求，避免被限流
+    return result
+
+
+def start_pepb_update(secids):
+    global _pepb_thread, _pepb_result
+    with _pepb_lock:
+        if _pepb_thread is not None and _pepb_thread.is_alive():
+            return False
+        today = datetime.date.today().strftime('%Y-%m-%d')
+        need = []
+        for secid in secids:
+            cached = _get_pepb_cache().get(secid)
+            if not isinstance(cached, dict) or cached.get('date') != today:
+                need.append(secid)
+        if not need:
+            return False
+        _pepb_result = None
+
+        def run():
+            global _pepb_result
+            _pepb_result = _pepb_worker(need)
+
+        _pepb_thread = threading.Thread(target=run, daemon=True)
+        _pepb_thread.start()
+        return True
+
+
+def complete_pepb_update():
+    global _pepb_thread, _pepb_result
+    with _pepb_lock:
+        if _pepb_thread is None or _pepb_thread.is_alive():
+            return False
+        today = datetime.date.today().strftime('%Y-%m-%d')
+        if _pepb_result:
+            cache = _get_pepb_cache()
+            for secid, entry in _pepb_result.items():
+                cache[secid] = {'date': today, 'pe': entry['pe'], 'pb': entry['pb']}
+            save_json_cache(PEPB_CACHE_FILE, cache)
+        _pepb_thread = None
+        _pepb_result = None
+        return True
+
+
+def get_pepb(secid):
+    """只读当天缓存；缺失时启动后台补齐并返回 None。"""
+    today = datetime.date.today().strftime('%Y-%m-%d')
+    cached = _get_pepb_cache().get(secid)
+    if isinstance(cached, dict) and cached.get('date') == today:
+        if cached.get('pe') is None and cached.get('pb') is None:
+            return None
+        return {'pe': cached.get('pe'), 'pb': cached.get('pb')}
+    start_pepb_update([secid])
+    return None
