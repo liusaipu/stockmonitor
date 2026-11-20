@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string[]]$Secids,
     [string]$Fields,
     [int]$Timeout = 5
@@ -12,15 +12,10 @@ function Convert-Secid($Secid) {
     $parts = $Secid -split '\.', 2
     $market = if ($parts.Count -eq 2) { $parts[0] } else { '0' }
     $code = if ($parts.Count -eq 2) { $parts[1] } else { $Secid }
-    if ($market -eq '1') {
-        $prefix = if ($code -match '^000(001|688)$') { 's_sh' } else { 'sh' }
-    } elseif ($market -eq '0') {
-        if ($code -match '^899\d{3}$') { $prefix = 's_bj' }
-        elseif ($code -match '^(399|930)\d{3}$') { $prefix = 's_sz' }
-        elseif ($code -match '^(4|8|92)\d{4,5}$') { $prefix = 'bj' }
-        else { $prefix = 'sz' }
-    } else {
-        $prefix = 'bj'
+    $prefix = if ($market -eq '1') { 'sh' } else { 'sz' }
+    if (($market -eq '1' -and $code -match '^000(001|688)$') -or
+        ($market -eq '0' -and $code -match '^(399|899|930)\d{3}$')) {
+        $prefix = 's_' + $prefix
     }
     $prefix + $code
 }

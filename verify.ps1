@@ -24,7 +24,6 @@ $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
-$psi.EnvironmentVariables['WATCH_NO_PAUSE'] = '1'
 $proc = [System.Diagnostics.Process]::Start($psi)
 $stdout = $proc.StandardOutput.ReadToEnd()
 $stderr = $proc.StandardError.ReadToEnd()

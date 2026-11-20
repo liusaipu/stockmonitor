@@ -110,17 +110,21 @@ function Convert-SecidToSinaCode($secid) {
 
     }
 
-    $prefix = ''
-    if ($market -eq '1') {
-        if ($code -match '^000(001|688)$') { $prefix = 's_sh' } else { $prefix = 'sh' }
-    } elseif ($market -eq '0') {
-        if ($code -match '^899\d{3}$') { $prefix = 's_bj' }
-        elseif ($code -match '^(399|930)\d{3}$') { $prefix = 's_sz' }
-        elseif ($code -match '^(4|8|92)\d{4,5}$') { $prefix = 'bj' }
-        else { $prefix = 'sz' }
-    } else {
-        $prefix = 'bj'
+    $prefix = switch ($market) {
+
+        '0' { 'sz' }
+
+        '1' { 'sh' }
+
+        default { 'bj' }
+
     }
+
+    $isShIndex = ($market -eq '1') -and ($code -match '^000(001|688)$')
+
+    $isSzOrBjIndex = ($market -eq '0') -and ($code -match '^(399|899|930)\d{3}$')
+
+    if ($isShIndex -or $isSzOrBjIndex) { $prefix = 's_' + $prefix }
 
     return "$prefix$code"
 
@@ -150,7 +154,7 @@ function Parse-SinaQuoteResponse($text) {
 
             '^s?_?sz' { '0' }
 
-            '^s?_?bj' { '0' }
+            '^s?_?bj' { 'other' }
 
             default { '1' }
 
@@ -512,24 +516,6 @@ $script:secidCachePath = Join-Path $PSScriptRoot '.secids_cache.json'
 
 $script:secidCache = @{}
 
-function Write-JsonFile($path, $data) {
-    # 统一缓存格式：UTF-8 无 BOM、临时文件原子替换，供 macOS/Linux Python 版共用。
-    try {
-        $json = $data | ConvertTo-Json -Depth 8
-        $utf8 = New-Object System.Text.UTF8Encoding($false)
-        $tmp = "$path.tmp"
-        [System.IO.File]::WriteAllText($tmp, $json, $utf8)
-        if (Test-Path -LiteralPath $path) {
-            [System.IO.File]::Replace($tmp, $path, $null)
-        } else {
-            [System.IO.File]::Move($tmp, $path)
-        }
-    } catch {
-        # Replace 在个别文件系统上可能失败，退回到 Move-Item
-        try { Move-Item -LiteralPath $tmp -Destination $path -Force } catch {}
-    }
-}
-
 function Load-SecidCache {
 
     if (Test-Path $script:secidCachePath) {
@@ -558,7 +544,7 @@ function Save-SecidCache {
 
     try {
 
-        Write-JsonFile $script:secidCachePath $script:secidCache
+        $script:secidCache | ConvertTo-Json | Set-Content $script:secidCachePath -Encoding UTF8
 
     } catch {
 
@@ -608,7 +594,7 @@ function Save-HyCache {
 
     try {
 
-        Write-JsonFile $script:hyCachePath $script:hyCache
+        $script:hyCache | ConvertTo-Json | Set-Content $script:hyCachePath -Encoding UTF8
 
     } catch {
 
@@ -662,7 +648,7 @@ function Save-MarketTotalCache {
 
     try {
 
-        Write-JsonFile $script:marketTotalCachePath $script:marketTotalCache
+        $script:marketTotalCache | ConvertTo-Json | Set-Content $script:marketTotalCachePath -Encoding UTF8
 
     } catch {
 
@@ -706,7 +692,7 @@ function Save-MaCache {
 
     try {
 
-        Write-JsonFile $script:maCachePath $script:maCache
+        $script:maCache | ConvertTo-Json | Set-Content $script:maCachePath -Encoding UTF8
 
     } catch {
 
@@ -756,7 +742,7 @@ function Save-DepthCache {
 
     try {
 
-        Write-JsonFile $script:depthCachePath $script:depthCache
+        $script:depthCache | ConvertTo-Json | Set-Content $script:depthCachePath -Encoding UTF8
 
     } catch {
 
@@ -1465,17 +1451,21 @@ $script:depthJobScript = {
 
         }
 
-        $prefix = ''
-        if ($market -eq '1') {
-            if ($code -match '^000(001|688)$') { $prefix = 's_sh' } else { $prefix = 'sh' }
-        } elseif ($market -eq '0') {
-            if ($code -match '^899\d{3}$') { $prefix = 's_bj' }
-            elseif ($code -match '^(399|930)\d{3}$') { $prefix = 's_sz' }
-            elseif ($code -match '^(4|8|92)\d{4,5}$') { $prefix = 'bj' }
-            else { $prefix = 'sz' }
-        } else {
-            $prefix = 'bj'
+        $prefix = switch ($market) {
+
+            '0' { 'sz' }
+
+            '1' { 'sh' }
+
+            default { 'bj' }
+
         }
+
+        $isShIndex = ($market -eq '1') -and ($code -match '^000(001|688)$')
+
+        $isSzOrBjIndex = ($market -eq '0') -and ($code -match '^(399|899|930)\d{3}$')
+
+        if ($isShIndex -or $isSzOrBjIndex) { $prefix = 's_' + $prefix }
 
         return "$prefix$code"
 
@@ -1999,15 +1989,7 @@ function Complete-MarketTotalUpdate {
 
     $script:marketTotalJob = $null
 
-    # 今天没刷新成功时，只要缓存里三个市场都有足够历史数据，就继续显示
-    $cachedDays = 999999
-    foreach ($secid in @('1.000001', '0.399001', '0.899050')) {
-        $days = 0
-        $entry = $script:marketTotalCache[$secid]
-        if ($entry -ne $null) { $days = $entry.Count }
-        if ($days -lt $cachedDays) { $cachedDays = $days }
-    }
-    $script:marketHistoryReady = (($freshCount -eq 3) -or ($cachedDays -ge 6))
+    $script:marketHistoryReady = ($freshCount -eq 3)
 
     if ($received) { Save-MarketTotalCache }
 
@@ -2739,7 +2721,7 @@ function Save-PepbCache {
 
     try {
 
-        Write-JsonFile $script:pepbCachePath $script:pepbCache
+        $script:pepbCache | ConvertTo-Json | Set-Content $script:pepbCachePath -Encoding UTF8
 
     } catch {
 
@@ -4814,129 +4796,126 @@ function Restore-ConsoleInput {
 
 # ---------- 参数解析 ----------
 
-$script:HelpLines = @(
-    '用法: watch [刷新秒数] [--index on|off] [--stealth on|off] [--hy on|off] [--once] [-h]',
-    '',
-    '参数:',
-    '  刷新秒数          自动刷新间隔，默认 15 秒',
-    '  --index on|off    是否显示指数方块，默认 off',
-    '                    （隐蔽模式固定显示上证指数、深证成指）',
-    '  --stealth on|off  隐蔽模式（英文、朴素窗口标题），默认 on',
-    '  --hy on|off       获取并显示半年涨跌，默认 off',
-    '  --once            只取一次数据后退出',
-    '  -h, --help        显示此帮助信息',
-    '',
-    'Windows 下命令为 watch.cmd；macOS / Linux 下为 ./watch，参数完全相同。',
-    '',
-    '列表页快捷键:',
-    '  Esc        退出程序',
-    '  R          立即刷新行情',
-    '  C          按涨跌幅排序（高→低，再按一次恢复）',
-    '  V          按量比排序（高→低，再按一次恢复）',
-    '  S          切换隐蔽模式 / 普通模式',
-    '  B / F9     切换 npm 构建日志外观 / 正常行情',
-    '  ↑ / ↓      移动光标选择股票',
-    '  → / Enter  进入选中股票的盘口详情',
-    '',
-    '盘口详情页快捷键:',
-    '  R          刷新盘口',
-    '  ↑ / ↓      切换到上一只 / 下一只自选股盘口',
-    '  ← / Esc    返回列表',
-    '  Ctrl+C     强制退出'
-)
+if ($args -contains '--help' -or $args -contains '-h') {
 
-function Show-Help([bool]$ToError = $false) {
-    foreach ($line in $script:HelpLines) {
-        if ($ToError) { [Console]::Error.WriteLine($line) }
-        else { Write-Output $line }
-    }
-}
+    Write-Host "Usage: watch.cmd [interval] [--index on|off] [--stealth on|off] [--hy on|off] [--once]"
 
-function Fail-Usage([string]$Message) {
-    [Console]::Error.WriteLine("错误: $Message")
-    [Console]::Error.WriteLine("")
-    Show-Help $true
-    exit 2
-}
+    Write-Host ""
 
-function ConvertTo-OptBool([string]$Value) {
-    switch ($Value.Trim().ToLowerInvariant()) {
-        'on'    { return $true }
-        'true'  { return $true }
-        '1'     { return $true }
-        'yes'   { return $true }
-        'y'     { return $true }
-        'off'   { return $false }
-        'false' { return $false }
-        '0'     { return $false }
-        'no'    { return $false }
-        'n'     { return $false }
-        default { return $null }
-    }
-}
+    Write-Host "List view keys:"
 
-if (@($args) -contains '--help' -or @($args) -contains '-h') {
-    Show-Help $false
+    Write-Host "  R          refresh quotes"
+
+    Write-Host "  C          sort by change% (high->low, then original)"
+
+    Write-Host "  V          sort by volume ratio (high->low, then original)"
+
+    Write-Host "  S          toggle 简化/详情 模式"
+
+    Write-Host "  B / F9     toggle boss mode (fake npm build log)"
+
+    Write-Host "  Up/Down    move cursor"
+
+    Write-Host "  Right      enter depth view (5-level bid/ask)"
+
+    Write-Host "  Esc        exit"
+
+    Write-Host ""
+
+    Write-Host "Depth view keys:"
+
+    Write-Host "  R          refresh depth"
+
+    Write-Host "  Up/Down    previous/next stock in list order"
+
+    Write-Host "  Left/Esc   back to list"
+
     exit 0
+
 }
 
 $interval = 15
+
 $showIndex = $false
+
 $stealth = $true
+
 $fetchHy = $false
+
 $once = $false
 
 $i = 0
+
 while ($i -lt $args.Count) {
-    $arg = [string]$args[$i]
 
-    if ($arg -eq '--once' -or $arg -eq '-once') {
+    $arg = $args[$i]
+
+    if ($arg -eq '--index' -or $arg -eq '-index') {
+
+        $i++
+
+        if ($i -lt $args.Count -and ($args[$i] -eq 'on' -or $args[$i] -eq 'true')) {
+
+            $showIndex = $true
+
+        } else {
+
+            $showIndex = $false
+
+        }
+
+    } elseif ($arg -eq '--stealth' -or $arg -eq '-stealth') {
+
+        $i++
+
+        if ($i -lt $args.Count -and ($args[$i] -eq 'off' -or $args[$i] -eq 'false')) {
+
+            $stealth = $false
+
+        } else {
+
+            $stealth = $true
+
+        }
+
+    } elseif ($arg -eq '--hy' -or $arg -eq '-hy') {
+
+        $i++
+
+        if ($i -lt $args.Count -and ($args[$i] -eq 'on' -or $args[$i] -eq 'true')) {
+
+            $fetchHy = $true
+
+        } else {
+
+            $fetchHy = $false
+
+        }
+
+    } elseif ($arg -eq '--once' -or $arg -eq '-once') {
+
         $once = $true
-        $i++
-        continue
+
+    } else {
+
+        try {
+
+            $parsed = [int]$arg
+
+        } catch {
+
+            throw "无法识别的参数: $arg"
+
+        }
+
+        if ($parsed -le 0) { throw "刷新秒数必须大于 0: $arg" }
+
+        $interval = $parsed
+
     }
 
-    if ($arg.StartsWith('-')) {
-        $optName = $arg.TrimStart([char]'-')
-        $optValue = $null
-        $eqIndex = $optName.IndexOf('=')
-        if ($eqIndex -ge 0) {
-            $optValue = $optName.Substring($eqIndex + 1)
-            $optName = $optName.Substring(0, $eqIndex)
-        }
-        $optName = $optName.ToLowerInvariant()
-        if (@('index', 'stealth', 'hy') -notcontains $optName) {
-            Fail-Usage "无法识别的参数: $arg"
-        }
-        if ($null -eq $optValue) {
-            $i++
-            if ($i -ge $args.Count -or ([string]$args[$i]).StartsWith('-')) {
-                Fail-Usage "--$optName 需要 on 或 off"
-            }
-            $optValue = [string]$args[$i]
-        }
-        $optBool = ConvertTo-OptBool $optValue
-        if ($null -eq $optBool) {
-            Fail-Usage "--$optName 的值必须是 on 或 off（收到: $optValue）"
-        }
-        switch ($optName) {
-            'index'   { $showIndex = $optBool }
-            'stealth' { $stealth = $optBool }
-            'hy'      { $fetchHy = $optBool }
-        }
-        $i++
-        continue
-    }
-
-    $parsedInt = 0
-    if (-not [int]::TryParse($arg, [ref]$parsedInt)) {
-        Fail-Usage "无法识别的参数: $arg"
-    }
-    if ($parsedInt -le 0) {
-        Fail-Usage "刷新秒数必须大于 0（收到: $arg）"
-    }
-    $interval = $parsedInt
     $i++
+
 }
 
 # ---------- 初始化 ----------
@@ -4993,7 +4972,7 @@ if ($once) {
 
     if ($err) {
 
-        [Console]::Error.WriteLine($err)
+        Write-Host $err
 
         exit 1
 
@@ -5385,8 +5364,7 @@ try {
 
                                     Start-DepthUpdate $script:depthSecid $script:depthRow.f14
 
-                                    $depthNextRefreshTime = (Get-Date).AddSeconds(10)
-
+                                    $depthNextRefreshTime = (Get-Date).AddSeconds(10)
 
                                     break poll
 
@@ -5672,6 +5650,6 @@ try {
 
     Clear-Host
 
-    Write-Host "已退出"
+    Write-Host "Exited"
 
 }
